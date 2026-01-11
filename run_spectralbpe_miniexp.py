@@ -4,11 +4,12 @@ SpectralBPE minimal experiment (toy "proof/intuition" + optional micro-LM).
 
 What you get (toy stage, fully self-contained):
   - A synthetic corpus where each word = STEM+SUFFIX, with a known gold boundary.
-  - Train 4 tokenizers (batched, conflict-free):
+  - Train 5 tokenizers (batched, conflict-free):
       1) freq-BPE
-      2) PPMI-BPE (association-only)
-      3) SpectralBPE (PPMI + spectral coherence)
-      4) SpectralBPE-shuffled (same, but the spectral embedding is permuted as a control)
+      2) PMI-only BPE (association-only; PPMI)
+      3) PPMI-discounted BPE (count-weighted association)
+      4) SpectralBPE (PPMI-discounted + spectral coherence)
+      5) SpectralBPE-shuffled (same, but the spectral embedding is permuted as a control)
   - Plots:
       - boundary-retention curve vs merge steps
       - boundary-retention vs avg tokens/word (matched compression view)
@@ -16,7 +17,7 @@ What you get (toy stage, fully self-contained):
       - spectral distance of selected merges (mechanism plot)
 
 Optional real-text stage (requires torch; optionally huggingface `datasets`):
-  - Train the same 4 tokenizers on a small real corpus (WikiText-2 by default if `datasets` installed,
+  - Train the same 5 tokenizers on a small real corpus (WikiText-2 by default if `datasets` installed,
     otherwise you can pass --real_text_path).
   - Run a tiny LM for a small number of steps and report bits-per-byte (normalizes tokenizer length effects).
   - Run a quick English affix boundary probe (heuristic).
@@ -191,17 +192,16 @@ def compute_bigram_counts(
 
     return pair_counts, first_counts, second_counts, total_pairs
 
-def compute_ppmi_weights(
+def compute_ppmi(
     pair_counts: Dict[Tuple[str, str], int],
     first_counts: Dict[str, int],
     second_counts: Dict[str, int],
     total_pairs: int,
     tau: int,
-    alpha: float,
     eps: float = 1e-12,
 ) -> Dict[Tuple[str, str], float]:
     """
-    W_ij = 1{N>=tau} * PPMI(i,j) * N(i,j)^alpha.
+    PPMI(i,j) with a minimum count threshold tau.
     Here PMI uses directed bigram marginals:
       p(i) = sum_y N(i,y)/Z , p(j)=sum_x N(x,j)/Z, p(i,j)=N(i,j)/Z
     """
@@ -219,7 +219,7 @@ def compute_ppmi_weights(
         pmi = math.log((pij + eps) / (pi * pj + eps))
         if pmi <= 0:
             continue
-        weights[(a, b)] = float(pmi) * float(nij ** alpha)
+        weights[(a, b)] = float(pmi)
     return weights
 
 def compute_fiedler_embedding(
@@ -331,6 +331,8 @@ class TrainedBPETokenizer:
     merges: List[Tuple[str, str]]  # ordered by rank
     vocab: Set[str]
     merge_logs: List[MergeLog] = field(default_factory=list)
+    z_snapshot: Optional[np.ndarray] = None
+    vocab_snapshot: Optional[List[str]] = None
 
     def ranks(self) -> Dict[Tuple[str, str], int]:
         return {pair: i for i, pair in enumerate(self.merges)}
@@ -344,6 +346,7 @@ def train_batched_bpe(
     alpha: float,
     sigma: float,
     recompute_every: int,
+    shuffle_seed: Optional[int] = None,
     stem_set: Optional[Set[str]] = None,
     suffix_set: Optional[Set[str]] = None,
     log_z_for_all: bool = True,
@@ -355,11 +358,14 @@ def train_batched_bpe(
 
     method:
       - 'freq'
-      - 'ppmi'
+      - 'pmi_only'
+      - 'ppmi_discounted'
       - 'spectral'
       - 'spectral_shuffled' (control)
+    shuffle_seed:
+      - fixed permutation seed for 'spectral_shuffled' (default handled by caller)
     """
-    assert method in ("freq", "ppmi", "spectral", "spectral_shuffled")
+    assert method in ("freq", "pmi_only", "ppmi_discounted", "spectral", "spectral_shuffled")
 
     word_tokens = {w: list(w) for w in word_counts.keys()}
     vocab: Set[str] = set()
@@ -372,6 +378,9 @@ def train_batched_bpe(
     last_z: Optional[np.ndarray] = None
     last_vocab_list: Optional[List[str]] = None
     last_sigma: Optional[float] = None
+    first_z: Optional[np.ndarray] = None
+    first_vocab_list: Optional[List[str]] = None
+    shuffle_perm: Optional[np.ndarray] = None
 
     t0 = time.time()
     batch_id = 0
@@ -383,17 +392,29 @@ def train_batched_bpe(
                 print(f"[{method}] no more pairs; stopping")
             break
 
-        need_weights = method in ("ppmi", "spectral", "spectral_shuffled") or log_z_for_all
-        weights = compute_ppmi_weights(pair_counts, first_counts, second_counts, total_pairs, tau=tau, alpha=alpha) if need_weights else {}
+        need_ppmi = method in ("pmi_only", "ppmi_discounted", "spectral", "spectral_shuffled") or log_z_for_all
+        ppmi = compute_ppmi(pair_counts, first_counts, second_counts, total_pairs, tau=tau) if need_ppmi else {}
 
         need_z = method in ("spectral", "spectral_shuffled") or log_z_for_all
         if need_z and (last_z is None or last_vocab_list is None or len(last_vocab_list) != len(vocab) or (batch_id % max(1, recompute_every) == 0)):
             vocab_list = sorted(vocab)
-            z = compute_fiedler_embedding(vocab_list, weights)
+            weights_for_z: Dict[Tuple[str, str], float] = {}
+            if ppmi:
+                for (a, b), pp in ppmi.items():
+                    nij = pair_counts.get((a, b), 0)
+                    if nij <= 0:
+                        continue
+                    weights_for_z[(a, b)] = float(pp) * float(nij ** alpha)
+            z = compute_fiedler_embedding(vocab_list, weights_for_z)
             if method == "spectral_shuffled":
-                rng = np.random.default_rng(12345 + batch_id)
-                z = z.copy()
-                rng.shuffle(z)
+                if shuffle_seed is None:
+                    shuffle_seed = 0
+                if shuffle_perm is None or len(shuffle_perm) != len(z):
+                    shuffle_perm = np.random.default_rng(shuffle_seed).permutation(len(z))
+                z = z.copy()[shuffle_perm]
+            if first_z is None:
+                first_z = z.copy()
+                first_vocab_list = list(vocab_list)
             last_z = z
             last_vocab_list = vocab_list
 
@@ -401,7 +422,7 @@ def train_batched_bpe(
             if sigma <= 0:
                 idx = {t: i for i, t in enumerate(vocab_list)}
                 dists = []
-                for (a, b), w in weights.items():
+                for (a, b), w in weights_for_z.items():
                     ia = idx.get(a)
                     ib = idx.get(b)
                     if ia is None or ib is None:
@@ -423,10 +444,13 @@ def train_batched_bpe(
             if method == "freq":
                 score = float(nij)
             else:
-                w = float(weights.get((a, b), 0.0))
-                if w <= 0:
+                pp = float(ppmi.get((a, b), 0.0))
+                if pp <= 0:
                     continue
-                score = float(nij) * w
+                if method == "pmi_only":
+                    score = pp
+                else:
+                    score = pp * float(nij ** alpha)
                 if method in ("spectral", "spectral_shuffled"):
                     ia = idx_map.get(a)
                     ib = idx_map.get(b)
@@ -511,7 +535,14 @@ def train_batched_bpe(
             elapsed = time.time() - t0
             print(f"[{method}] batch {batch_id:4d} | merges {len(merges):5d} | vocab {len(vocab):5d} | elapsed {elapsed:5.1f}s")
 
-    return TrainedBPETokenizer(method=method, merges=merges, vocab=vocab, merge_logs=logs)
+    return TrainedBPETokenizer(
+        method=method,
+        merges=merges,
+        vocab=vocab,
+        merge_logs=logs,
+        z_snapshot=first_z if first_z is not None else last_z,
+        vocab_snapshot=first_vocab_list if first_vocab_list is not None else last_vocab_list,
+    )
 
 
 # ==========================
@@ -673,6 +704,27 @@ def auc_boundary_vs_tokens(curve: List[Dict[str, float]], min_tokens_per_word: f
     return float(area / denom)
 
 
+def boundary_bigram_ranks(
+    merges: List[Tuple[str, str]],
+    boundary_pairs: List[Tuple[str, str]],
+) -> Dict[Tuple[str, str], Optional[int]]:
+    rank_map = {pair: i + 1 for i, pair in enumerate(merges)}
+    return {pair: rank_map.get(pair) for pair in boundary_pairs}
+
+
+def summarize_boundary_ranks(rank_map: Dict[Tuple[str, str], Optional[int]]) -> Dict[str, Optional[float]]:
+    vals = [r for r in rank_map.values() if r is not None]
+    missing = len(rank_map) - len(vals)
+    if not vals:
+        return {"min": None, "mean": None, "max": None, "missing": missing}
+    return {
+        "min": float(min(vals)),
+        "mean": float(np.mean(vals)),
+        "max": float(max(vals)),
+        "missing": missing,
+    }
+
+
 # ==========================
 # Plotting helpers
 # ==========================
@@ -762,6 +814,40 @@ def plot_zdist(logs_by_method: Dict[str, List[MergeLog]], out_path: str, title: 
     plt.tight_layout()
     plt.savefig(out_path, dpi=200)
     plt.close()
+
+
+def plot_z_hist_stem_suffix(
+    z_by_method: Dict[str, np.ndarray],
+    vocab_by_method: Dict[str, List[str]],
+    stem_set: Set[str],
+    suffix_set: Set[str],
+    out_path: str,
+    title: str,
+) -> None:
+    methods = list(z_by_method.keys())
+    if not methods:
+        return
+    fig, axes = plt.subplots(len(methods), 1, figsize=(7, 3 * len(methods)))
+    if len(methods) == 1:
+        axes = [axes]
+    for ax, name in zip(axes, methods):
+        z = z_by_method[name]
+        vocab_list = vocab_by_method[name]
+        stem_z = [float(z[i]) for i, tok in enumerate(vocab_list) if tok in stem_set]
+        suffix_z = [float(z[i]) for i, tok in enumerate(vocab_list) if tok in suffix_set]
+        if not stem_z or not suffix_z:
+            ax.text(0.5, 0.5, "No stem/suffix chars found", ha="center", va="center")
+        else:
+            ax.hist(stem_z, bins=30, alpha=0.6, density=True, label="stem", color="#1f77b4")
+            ax.hist(suffix_z, bins=30, alpha=0.6, density=True, label="suffix", color="#ff7f0e")
+        ax.set_title(name)
+        ax.set_ylabel("density")
+        ax.legend()
+    axes[-1].set_xlabel("z value")
+    fig.suptitle(title)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig(out_path, dpi=200)
+    plt.close(fig)
 
 
 # ==========================
@@ -1063,7 +1149,7 @@ def run_toy_stage(args) -> Dict[str, Any]:
     print(f"Train word types: {len(train_counts):,} | total word occurrences: {sum(train_counts.values()):,}")
     print(f"Val word types:   {len(val_samples):,}")
 
-    methods = ["freq", "ppmi", "spectral", "spectral_shuffled"]
+    methods = ["freq", "pmi_only", "ppmi_discounted", "spectral", "spectral_shuffled"]
     trained: Dict[str, TrainedBPETokenizer] = {}
 
     for m in methods:
@@ -1077,6 +1163,7 @@ def run_toy_stage(args) -> Dict[str, Any]:
             alpha=args.alpha,
             sigma=args.sigma,
             recompute_every=args.recompute_every,
+            shuffle_seed=args.shuffle_seed if args.shuffle_seed >= 0 else args.seed,
             stem_set=stem_set,
             suffix_set=suffix_set,
             log_z_for_all=True,
@@ -1090,6 +1177,25 @@ def run_toy_stage(args) -> Dict[str, Any]:
             print(f"[{m}] first cross-boundary merge at step {first_cross.step}: ({first_cross.a},{first_cross.b}) score={first_cross.score:.2f}")
         else:
             print(f"[{m}] no cross-boundary merges observed (unexpected on this toy)")
+
+    boundary_pairs = list(zip(list(args.toy_end_chars), list(args.toy_start_chars)))
+    boundary_rank_rows = []
+    boundary_rank_maps: Dict[str, Dict[Tuple[str, str], Optional[int]]] = {}
+    boundary_rank_summaries: Dict[str, Dict[str, Optional[float]]] = {}
+    for m in methods:
+        rank_map = boundary_bigram_ranks(trained[m].merges, boundary_pairs)
+        summary = summarize_boundary_ranks(rank_map)
+        boundary_rank_maps[m] = rank_map
+        boundary_rank_summaries[m] = summary
+        boundary_rank_rows.append([
+            m,
+            "n/a" if summary["min"] is None else f"{summary['min']:.0f}",
+            "n/a" if summary["mean"] is None else f"{summary['mean']:.1f}",
+            "n/a" if summary["max"] is None else f"{summary['max']:.0f}",
+            int(summary["missing"] or 0),
+        ])
+    print("\nBoundary bigram merge ranks (lower = earlier):")
+    print(pretty_table(boundary_rank_rows, headers=["method", "min_rank", "mean_rank", "max_rank", "missing"]))
 
     # Boundary retention curve (key "intuition" plot)
     curves_by_merge = {}
@@ -1160,6 +1266,23 @@ def run_toy_stage(args) -> Dict[str, Any]:
                title="Toy: spectral distance of chosen merges (mechanism plot)",
                max_merges=args.plot_max_merges,
                smooth=max(1, args.plot_smooth))
+    z_hist_methods = {}
+    z_hist_vocab = {}
+    for m in ("spectral", "spectral_shuffled"):
+        tok = trained.get(m)
+        if tok is None or tok.z_snapshot is None or tok.vocab_snapshot is None:
+            continue
+        z_hist_methods[m] = tok.z_snapshot
+        z_hist_vocab[m] = tok.vocab_snapshot
+    if z_hist_methods:
+        plot_z_hist_stem_suffix(
+            z_hist_methods,
+            z_hist_vocab,
+            stem_set,
+            suffix_set,
+            os.path.join(args.out_dir, "toy_z_hist_stem_suffix.png"),
+            title="Toy: z distributions for stem vs suffix chars",
+        )
 
     # Save raw results
     results = {
@@ -1172,12 +1295,19 @@ def run_toy_stage(args) -> Dict[str, Any]:
                 "alpha": args.alpha,
                 "sigma": args.sigma,
                 "recompute_every": args.recompute_every,
+                "shuffle_seed": args.shuffle_seed if args.shuffle_seed >= 0 else args.seed,
             },
             "curves": {m: curves_by_merge[m] for m in methods},
             "curves_by_merge": {m: curves_by_merge[m] for m in methods},
             "curves_full": {m: curves_full[m] for m in methods},
             "curves_by_tokens": {m: curves_by_tokens[m] for m in methods},
             "matched_tokens_per_word": float(matched_tokens),
+            "boundary_bigram_pairs": [[a, b] for a, b in boundary_pairs],
+            "boundary_bigram_ranks": {
+                m: {f"{a}|{b}": boundary_rank_maps[m][(a, b)] for (a, b) in boundary_pairs}
+                for m in methods
+            },
+            "boundary_bigram_rank_summary": boundary_rank_summaries,
             "final_summary": {row[0]: {
                 "boundary_acc": float(row[1]),
                 "boundary_f1": float(row[2]),
@@ -1215,7 +1345,7 @@ def run_real_lm_stage(args) -> Optional[Dict[str, Any]]:
     train_counts = build_word_counts_from_text(train_text, lower=args.real_lower)
     print(f"Real tokenizer training word types: {len(train_counts):,} | total word occurrences: {sum(train_counts.values()):,}")
 
-    methods = ["freq", "ppmi", "spectral", "spectral_shuffled"]
+    methods = ["freq", "pmi_only", "ppmi_discounted", "spectral", "spectral_shuffled"]
     trained: Dict[str, TrainedBPETokenizer] = {}
 
     for m in methods:
@@ -1229,6 +1359,7 @@ def run_real_lm_stage(args) -> Optional[Dict[str, Any]]:
             alpha=args.alpha,
             sigma=args.sigma,
             recompute_every=args.recompute_every,
+            shuffle_seed=args.shuffle_seed if args.shuffle_seed >= 0 else args.seed,
             stem_set=None,
             suffix_set=None,
             log_z_for_all=False,
@@ -1281,6 +1412,13 @@ def run_real_lm_stage(args) -> Optional[Dict[str, Any]]:
         val_ids, val_bytes = encode_text_to_ids(val_text, trained[m], lower=args.real_lower)
         vocab_list = sorted(trained[m].vocab)
         vocab_size = len(vocab_list)
+        tokens_per_byte = float(len(val_ids) / max(1, val_bytes))
+        if args.lm_byte_span > 0:
+            seq_len = int(round(args.lm_byte_span * tokens_per_byte))
+            seq_len = max(args.lm_seq_len_min, min(args.lm_seq_len_max, seq_len))
+        else:
+            seq_len = args.lm_seq_len
+        print(f"[{m}] tokens/byte={tokens_per_byte:.3f} -> seq_len={seq_len} (byte_span={args.lm_byte_span})")
 
         # Affix boundary metric
         enc = make_bpe_encoder(trained[m].merges)
@@ -1296,7 +1434,7 @@ def run_real_lm_stage(args) -> Optional[Dict[str, Any]]:
             seed=args.seed,
             steps=args.lm_steps,
             batch_size=args.lm_batch_size,
-            seq_len=args.lm_seq_len,
+            seq_len=seq_len,
             d_model=args.lm_d_model,
             n_layers=args.lm_layers,
             n_heads=args.lm_heads,
@@ -1309,6 +1447,7 @@ def run_real_lm_stage(args) -> Optional[Dict[str, Any]]:
             "train_tokens": len(train_ids),
             "val_tokens": len(val_ids),
             "val_bytes": val_bytes,
+            "seq_len": seq_len,
             "probe_boundary_acc": probe_met["boundary_acc"],
             "probe_boundary_f1": probe_met["f1"],
             **lm_met,
@@ -1328,9 +1467,13 @@ def run_real_lm_stage(args) -> Optional[Dict[str, Any]]:
     out = {"real": {"config": {
         "real_vocab_size": args.real_vocab_size,
         "real_batch_size": args.real_batch_size,
+        "shuffle_seed": args.shuffle_seed if args.shuffle_seed >= 0 else args.seed,
         "lm_steps": args.lm_steps,
         "lm_batch_size": args.lm_batch_size,
         "lm_seq_len": args.lm_seq_len,
+        "lm_byte_span": args.lm_byte_span,
+        "lm_seq_len_min": args.lm_seq_len_min,
+        "lm_seq_len_max": args.lm_seq_len_max,
         "lm_d_model": args.lm_d_model,
         "lm_layers": args.lm_layers,
         "lm_heads": args.lm_heads,
@@ -1347,6 +1490,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--out_dir", type=str, default="spectralbpe_miniexp_out")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--shuffle_seed", type=int, default=-1, help="seed for spectral_shuffled permutation (-1 => use --seed)")
 
     # Shared method params
     p.add_argument("--tau", type=int, default=2)
@@ -1388,6 +1532,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lm_steps", type=int, default=1200)
     p.add_argument("--lm_batch_size", type=int, default=64)
     p.add_argument("--lm_seq_len", type=int, default=128)
+    p.add_argument("--lm_byte_span", type=int, default=512)
+    p.add_argument("--lm_seq_len_min", type=int, default=64)
+    p.add_argument("--lm_seq_len_max", type=int, default=256)
     p.add_argument("--lm_d_model", type=int, default=256)
     p.add_argument("--lm_layers", type=int, default=4)
     p.add_argument("--lm_heads", type=int, default=4)
