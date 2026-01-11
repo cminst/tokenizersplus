@@ -1,0 +1,63 @@
+{
+  "real": {
+    "config": {
+      "device": "cuda",
+      "lm_batch_size": 64,
+      "lm_d_model": 256,
+      "lm_heads": 4,
+      "lm_layers": 4,
+      "lm_lr": 0.0003,
+      "lm_seq_len": 128,
+      "lm_steps": 1500,
+      "real_batch_size": 50,
+      "real_lower": false,
+      "real_vocab_size": 4000
+    },
+    "metrics": {
+      "freq": {
+        "bits_per_byte": 2.1104997496293523,
+        "probe_boundary_acc": 0.3157894736842105,
+        "probe_boundary_f1": 0.3,
+        "tokens_per_byte": 0.34194205590676213,
+        "train_tokens": 657234,
+        "val_bytes": 200262,
+        "val_loss_nats_per_token": 4.2781720638275145,
+        "val_tokens": 68478,
+        "vocab_size": 4034
+      },
+      "ppmi": {
+        "bits_per_byte": 2.0914451170363715,
+        "probe_boundary_acc": 0.22807017543859648,
+        "probe_boundary_f1": 0.20155038759689922,
+        "tokens_per_byte": 0.36795797505268096,
+        "train_tokens": 709129,
+        "val_bytes": 200262,
+        "val_loss_nats_per_token": 3.939795804023743,
+        "val_tokens": 73688,
+        "vocab_size": 4034
+      },
+      "spectral": {
+        "bits_per_byte": 2.097652263827687,
+        "probe_boundary_acc": 0.3508771929824561,
+        "probe_boundary_f1": 0.3125,
+        "tokens_per_byte": 0.3661803038020194,
+        "train_tokens": 705956,
+        "val_bytes": 200262,
+        "val_loss_nats_per_token": 3.9706716537475586,
+        "val_tokens": 73332,
+        "vocab_size": 4034
+      },
+      "spectral_shuffled": {
+        "bits_per_byte": 2.0916956466114867,
+        "probe_boundary_acc": 0.22807017543859648,
+        "probe_boundary_f1": 0.22608695652173913,
+        "tokens_per_byte": 0.3642528287942795,
+        "train_tokens": 700898,
+        "val_bytes": 200262,
+        "val_loss_nats_per_token": 3.9803477843602497,
+        "val_tokens": 72946,
+        "vocab_size": 4034
+      }
+    }
+  }
+}
