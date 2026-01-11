@@ -11,6 +11,7 @@ What you get (toy stage, fully self-contained):
       4) SpectralBPE-shuffled (same, but the spectral embedding is permuted as a control)
   - Plots:
       - boundary-retention curve vs merge steps
+      - boundary-retention vs avg tokens/word (matched compression view)
       - cross-boundary merge fraction vs merge steps
       - spectral distance of selected merges (mechanism plot)
 
@@ -614,19 +615,62 @@ def evaluate_boundary_f1(
         "avg_tokens_per_word": float(avg_toks),
     }
 
+def boundary_curve_with_tokens(
+    samples: List[Tuple[str, int, int]],
+    merges: List[Tuple[str, str]],
+    max_merges: int,
+    step: int,
+) -> List[Dict[str, float]]:
+    curve: List[Dict[str, float]] = []
+    max_merges = min(max_merges, len(merges))
+    for m in range(0, max_merges + 1, step):
+        enc = make_bpe_encoder(merges[:m])
+        met = evaluate_boundary_f1(samples, enc)
+        curve.append({
+            "merges": int(m),
+            "boundary_acc": float(met["boundary_acc"]),
+            "boundary_f1": float(met["f1"]),
+            "avg_tokens_per_word": float(met["avg_tokens_per_word"]),
+        })
+    return curve
+
 def boundary_acc_curve(
     samples: List[Tuple[str, int, int]],
     merges: List[Tuple[str, str]],
     max_merges: int,
     step: int,
 ) -> List[Tuple[int, float]]:
-    curve: List[Tuple[int, float]] = []
-    max_merges = min(max_merges, len(merges))
-    for m in range(0, max_merges + 1, step):
-        enc = make_bpe_encoder(merges[:m])
-        met = evaluate_boundary_f1(samples, enc)
-        curve.append((m, met["boundary_acc"]))
-    return curve
+    curve = boundary_curve_with_tokens(samples, merges, max_merges, step)
+    return [(int(pt["merges"]), pt["boundary_acc"]) for pt in curve]
+
+def auc_boundary_vs_tokens(curve: List[Dict[str, float]], min_tokens_per_word: float) -> Optional[float]:
+    if not curve or min_tokens_per_word <= 0:
+        return None
+    pts = sorted([(pt["avg_tokens_per_word"], pt["boundary_acc"]) for pt in curve], key=lambda x: -x[0])
+    if len(pts) < 2:
+        return None
+    start_x = pts[0][0]
+    if min_tokens_per_word >= start_x:
+        return None
+    area = 0.0
+    prev_x, prev_y = pts[0]
+    for x, y in pts[1:]:
+        if x >= min_tokens_per_word:
+            dx = prev_x - x
+            area += 0.5 * (prev_y + y) * dx
+            prev_x, prev_y = x, y
+            continue
+        # partial segment to threshold
+        if prev_x > min_tokens_per_word > x:
+            frac = (prev_x - min_tokens_per_word) / max(1e-9, (prev_x - x))
+            y_t = prev_y + (y - prev_y) * frac
+            dx = prev_x - min_tokens_per_word
+            area += 0.5 * (prev_y + y_t) * dx
+        break
+    denom = start_x - min_tokens_per_word
+    if denom <= 0:
+        return None
+    return float(area / denom)
 
 
 # ==========================
@@ -640,6 +684,22 @@ def plot_boundary_curves(curves: Dict[str, List[Tuple[int, float]]], out_path: s
         ys = [p[1] for p in pts]
         plt.plot(xs, ys, label=name)
     plt.xlabel("Number of merges applied")
+    plt.ylabel("Boundary retention (accuracy)")
+    plt.title(title)
+    plt.ylim(-0.02, 1.02)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+
+def plot_boundary_vs_tokens(curves: Dict[str, List[Tuple[float, float]]], out_path: str, title: str) -> None:
+    plt.figure()
+    for name, pts in curves.items():
+        pts_sorted = sorted(pts, key=lambda p: p[0])
+        xs = [p[0] for p in pts_sorted]
+        ys = [p[1] for p in pts_sorted]
+        plt.plot(xs, ys, label=name)
+    plt.xlabel("Avg tokens per word (fragmentation)")
     plt.ylabel("Boundary retention (accuracy)")
     plt.title(title)
     plt.ylim(-0.02, 1.02)
@@ -907,7 +967,10 @@ def affix_probe_samples_from_text(
     text: str,
     prefixes: List[str],
     suffixes: List[str],
-    min_base_count: int = 20,
+    min_base_count: int = 5,
+    min_derived_count: int = 2,
+    min_extra_len: int = 2,
+    exclude_affixed_base: bool = False,
     lower: bool = True,
     max_samples: int = 5000,
 ) -> List[Tuple[str, int, int]]:
@@ -915,6 +978,9 @@ def affix_probe_samples_from_text(
     Build a heuristic boundary probe set:
       - If word = prefix + base and base appears as a standalone word often enough, boundary at prefix.
       - If word = base + suffix and base appears often enough, boundary at base.
+      - Require derived word appears at least min_derived_count times.
+      - Require derived length >= base length + min_extra_len.
+      - Optionally exclude bases that are themselves affixed forms.
     We encode with '▁'+word, so boundary indices include that leading '▁' (index shift by 1).
     Returns samples (word_token, boundary_idx, count) where word_token includes leading '▁'.
     """
@@ -923,25 +989,47 @@ def affix_probe_samples_from_text(
     words = re.findall(r"[a-z]+", text)
     counts = collections.Counter(words)
 
+    def base_is_affixed(base: str) -> bool:
+        if not exclude_affixed_base:
+            return False
+        for p in prefixes:
+            if base.startswith(p) and len(base) > len(p) + min_extra_len:
+                return True
+        for s in suffixes:
+            if base.endswith(s) and len(base) > len(s) + min_extra_len:
+                return True
+        return False
+
     samples: List[Tuple[str, int, int]] = []
     for w, c in counts.items():
-        if c <= 0:
+        if c < min_derived_count:
             continue
+        skip_word = False
         # prefix cases
         for p in prefixes:
-            if w.startswith(p) and len(w) > len(p) + 2:
+            if w.startswith(p):
                 base = w[len(p):]
-                if counts.get(base, 0) >= min_base_count:
-                    # boundary after '▁'+prefix
-                    samples.append(("▁" + w, 1 + len(p), c))
-                    break
+                if len(base) >= 1 and len(w) >= len(base) + min_extra_len:
+                    if base_is_affixed(base):
+                        skip_word = True
+                        break
+                    if counts.get(base, 0) >= min_base_count:
+                        # boundary after '▁'+prefix
+                        samples.append(("▁" + w, 1 + len(p), c))
+                        break
+        if skip_word:
+            continue
         # suffix cases
         for s in suffixes:
-            if w.endswith(s) and len(w) > len(s) + 2:
+            if w.endswith(s):
                 base = w[: -len(s)]
-                if counts.get(base, 0) >= min_base_count:
-                    samples.append(("▁" + w, 1 + len(base), c))
-                    break
+                if len(base) >= 1 and len(w) >= len(base) + min_extra_len:
+                    if base_is_affixed(base):
+                        skip_word = True
+                        break
+                    if counts.get(base, 0) >= min_base_count:
+                        samples.append(("▁" + w, 1 + len(base), c))
+                        break
 
     # subsample if huge
     if len(samples) > max_samples:
@@ -1004,14 +1092,36 @@ def run_toy_stage(args) -> Dict[str, Any]:
             print(f"[{m}] no cross-boundary merges observed (unexpected on this toy)")
 
     # Boundary retention curve (key "intuition" plot)
-    curves = {}
+    curves_by_merge = {}
+    curves_by_tokens = {}
+    curves_full = {}
     for m in methods:
-        curves[m] = boundary_acc_curve(
+        curve = boundary_curve_with_tokens(
             val_samples,
             trained[m].merges,
             max_merges=args.plot_max_merges,
             step=args.plot_step,
         )
+        curves_full[m] = curve
+        curves_by_merge[m] = [(int(pt["merges"]), pt["boundary_acc"]) for pt in curve]
+        curves_by_tokens[m] = [(pt["avg_tokens_per_word"], pt["boundary_acc"]) for pt in curve]
+
+    min_tokens_by_method = [min(pt["avg_tokens_per_word"] for pt in curves_full[m]) for m in methods]
+    max_tokens_by_method = [max(pt["avg_tokens_per_word"] for pt in curves_full[m]) for m in methods]
+    common_min_tokens = max(min_tokens_by_method)
+    common_max_tokens = min(max_tokens_by_method)
+    if args.matched_tokens_per_word > 0:
+        matched_tokens = args.matched_tokens_per_word
+        if matched_tokens < common_min_tokens:
+            matched_tokens = common_min_tokens
+        if matched_tokens > common_max_tokens:
+            matched_tokens = common_max_tokens
+    else:
+        matched_tokens = common_min_tokens
+
+    auc_by_method = {}
+    for m in methods:
+        auc_by_method[m] = auc_boundary_vs_tokens(curves_full[m], matched_tokens)
 
     # Final tokenization quality (often will be 0 boundary retention after enough merges; curve is the point)
     final_rows = []
@@ -1028,17 +1138,20 @@ def run_toy_stage(args) -> Dict[str, Any]:
             f"{met['boundary_acc']:.3f}",
             f"{met['f1']:.3f}",
             f"{met['avg_tokens_per_word']:.2f}",
+            f"{auc_by_method[m]:.3f}" if auc_by_method[m] is not None else "n/a",
             f"{cross_frac:.3f}" if cross_frac is not None else "n/a",
             f"{mean_z:.4f}",
         ])
 
     print("\nToy summary (final tokenizer at target vocab):")
-    print(pretty_table(final_rows, headers=["method", "boundary_acc", "boundary_F1", "avg_toks/word", "cross_merge_frac", "mean|z_i-z_j| (first50)"]))
+    print(pretty_table(final_rows, headers=["method", "boundary_acc", "boundary_F1", "avg_toks/word", f"auc_acc@toks<= {matched_tokens:.2f}", "cross_merge_frac", "mean|z_i-z_j| (first50)"]))
 
     # Save plots
     ensure_dir(args.out_dir)
-    plot_boundary_curves(curves, os.path.join(args.out_dir, "toy_boundary_retention.png"),
+    plot_boundary_curves(curves_by_merge, os.path.join(args.out_dir, "toy_boundary_retention.png"),
                          title="Toy: boundary retention vs merges (higher is better)")
+    plot_boundary_vs_tokens(curves_by_tokens, os.path.join(args.out_dir, "toy_boundary_retention_vs_tokens.png"),
+                            title="Toy: boundary retention vs avg tokens/word (matched compression)")
     logs_by_method = {m: trained[m].merge_logs for m in methods}
     plot_cross_boundary_frac(logs_by_method, os.path.join(args.out_dir, "toy_cross_boundary_merge_frac.png"),
                             title="Toy: cumulative cross-boundary merges (lower is better)",
@@ -1060,13 +1173,18 @@ def run_toy_stage(args) -> Dict[str, Any]:
                 "sigma": args.sigma,
                 "recompute_every": args.recompute_every,
             },
-            "curves": {m: curves[m] for m in methods},
+            "curves": {m: curves_by_merge[m] for m in methods},
+            "curves_by_merge": {m: curves_by_merge[m] for m in methods},
+            "curves_full": {m: curves_full[m] for m in methods},
+            "curves_by_tokens": {m: curves_by_tokens[m] for m in methods},
+            "matched_tokens_per_word": float(matched_tokens),
             "final_summary": {row[0]: {
                 "boundary_acc": float(row[1]),
                 "boundary_f1": float(row[2]),
                 "avg_toks_per_word": float(row[3]),
-                "cross_merge_frac": None if row[4]=="n/a" else float(row[4]),
-                "mean_zdist_first50": float(row[5]),
+                "auc_boundary_vs_tokens": None if row[4] == "n/a" else float(row[4]),
+                "cross_merge_frac": None if row[5]=="n/a" else float(row[5]),
+                "mean_zdist_first50": float(row[6]),
             } for row in final_rows},
             "first_20_merges": {
                 m: [{
@@ -1120,17 +1238,32 @@ def run_real_lm_stage(args) -> Optional[Dict[str, Any]]:
         print(f"[{m}] merges: {len(tok.merges):,} | vocab: {len(tok.vocab):,}")
 
     # Affix probe (heuristic)
-    prefixes = ["un", "re", "dis", "mis", "pre", "non", "anti", "inter", "trans", "sub", "super"]
-    suffixes = ["ing", "ed", "ly", "tion", "sion", "ment", "ness", "able", "less", "ist", "ive", "ous"]
+    prefixes = [
+        "un", "re", "dis", "mis", "pre", "non", "anti", "inter", "trans", "sub", "super",
+        "over", "under", "semi", "auto", "micro", "macro", "post", "pro", "de", "co",
+    ]
+    suffixes = [
+        "ing", "ed", "ly", "tion", "sion", "ment", "ness", "able", "less", "ist", "ive", "ous",
+        "ize", "ise", "al", "er", "or", "ship", "hood", "ward", "wise", "ful", "dom",
+    ]
+    if args.probe_text_source == "train":
+        probe_text = train_text
+    elif args.probe_text_source == "val":
+        probe_text = val_text
+    else:
+        probe_text = train_text + "\n" + val_text
     probe_samples = affix_probe_samples_from_text(
-        val_text,
+        probe_text,
         prefixes=prefixes,
         suffixes=suffixes,
         min_base_count=args.probe_min_base_count,
+        min_derived_count=args.probe_min_derived_count,
+        min_extra_len=args.probe_min_extra_len,
+        exclude_affixed_base=args.probe_exclude_affixed_base,
         lower=args.real_lower,
         max_samples=args.probe_max_samples,
     )
-    print(f"Affix probe samples: {len(probe_samples):,}")
+    print(f"Affix probe samples: {len(probe_samples):,} (source={args.probe_text_source})")
 
     # Encode train/val and run micro LM for each tokenizer
     try:
@@ -1262,8 +1395,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lm_eval_batches", type=int, default=30)
 
     # Probe
-    p.add_argument("--probe_min_base_count", type=int, default=20)
+    p.add_argument("--probe_min_base_count", type=int, default=5)
+    p.add_argument("--probe_min_derived_count", type=int, default=2)
+    p.add_argument("--probe_min_extra_len", type=int, default=2)
+    p.add_argument("--probe_exclude_affixed_base", action="store_true")
     p.add_argument("--probe_max_samples", type=int, default=5000)
+    p.add_argument("--probe_text_source", type=str, default="train", choices=["train", "val", "both"])
+    p.add_argument("--matched_tokens_per_word", type=float, default=0.0)
 
     return p.parse_args()
 
