@@ -331,8 +331,16 @@ class TrainedBPETokenizer:
     merges: List[Tuple[str, str]]  # ordered by rank
     vocab: Set[str]
     merge_logs: List[MergeLog] = field(default_factory=list)
+
+    # Debug snapshots (for mechanism plots / analysis)
     z_snapshot: Optional[np.ndarray] = None
     vocab_snapshot: Optional[List[str]] = None
+
+    # Diagnostics about the spectral coherence kernel (useful even for ablations)
+    effective_sigma: Optional[float] = None          # sigma actually used after auto-estimation and sigma_mult
+    sigma_mode: Optional[str] = None                # "auto" or "fixed"
+    sigma_mult: float = 1.0
+    coh_gamma: float = 1.0
 
     def ranks(self) -> Dict[Tuple[str, str], int]:
         return {pair: i for i, pair in enumerate(self.merges)}
@@ -345,6 +353,8 @@ def train_batched_bpe(
     tau: int,
     alpha: float,
     sigma: float,
+    sigma_mult: float,
+    coh_gamma: float,
     recompute_every: int,
     shuffle_seed: Optional[int] = None,
     stem_set: Optional[Set[str]] = None,
@@ -378,6 +388,7 @@ def train_batched_bpe(
     last_z: Optional[np.ndarray] = None
     last_vocab_list: Optional[List[str]] = None
     last_sigma: Optional[float] = None
+    last_sigma_mode: Optional[str] = None
     first_z: Optional[np.ndarray] = None
     first_vocab_list: Optional[List[str]] = None
     shuffle_perm: Optional[np.ndarray] = None
@@ -400,40 +411,64 @@ def train_batched_bpe(
             vocab_list = sorted(vocab)
             weights_for_z: Dict[Tuple[str, str], float] = {}
             if ppmi:
-                # Paper-style: build the Laplacian from association weights only (PPMI).
-                # Raw counts enter the merge score separately.
+                # Paper Eq. (5): W_ij = 1{N>=tau} * PPMI(i,j) * N(i,j)^alpha.
+                # `ppmi` already applies the count threshold tau, so we only multiply by N^alpha here.
                 for (a, b), pp in ppmi.items():
-                    weights_for_z[(a, b)] = float(pp)
-            z = compute_fiedler_embedding(vocab_list, weights_for_z)
+                    nij = pair_counts.get((a, b), 0)
+                    if nij <= 0:
+                        continue
+                    weights_for_z[(a, b)] = float(pp) * float(nij ** alpha)
+
+            # Compute spectral embedding (standardized). The shuffled control permutes this embedding.
+            z_raw = compute_fiedler_embedding(vocab_list, weights_for_z)
+
+            # sigma: if <=0, estimate from median |z_i-z_j| on weighted edges (using the *unshuffled* embedding)
+            if sigma <= 0:
+                idx = {t: i for i, t in enumerate(vocab_list)}
+                dists = []
+                for (a, b) in weights_for_z.keys():
+                    ia = idx.get(a)
+                    ib = idx.get(b)
+                    if ia is None or ib is None:
+                        continue
+                    dists.append(abs(float(z_raw[ia] - z_raw[ib])))
+                sigma_eff = (float(np.median(dists)) + 1e-6) if dists else 1.0
+                sigma_mode = "auto"
+            else:
+                sigma_eff = float(sigma)
+                sigma_mode = "fixed"
+
+            sigma_eff *= float(sigma_mult)
+
+            z = z_raw
             if method == "spectral_shuffled":
                 if shuffle_seed is None:
                     shuffle_seed = 0
-                if shuffle_perm is None or len(shuffle_perm) != len(z):
-                    shuffle_perm = np.random.default_rng(shuffle_seed).permutation(len(z))
-                z = z.copy()[shuffle_perm]
+                if shuffle_perm is None or len(shuffle_perm) != len(z_raw):
+                    shuffle_perm = np.random.default_rng(shuffle_seed).permutation(len(z_raw))
+                z = z_raw.copy()[shuffle_perm]
+
             if first_z is None:
                 first_z = z.copy()
                 first_vocab_list = list(vocab_list)
             last_z = z
             last_vocab_list = vocab_list
+            last_sigma = float(sigma_eff)
+            last_sigma_mode = sigma_mode
 
-            # sigma: if <=0, estimate from median |z_i-z_j| on weighted edges
-            if sigma <= 0:
-                idx = {t: i for i, t in enumerate(vocab_list)}
-                dists = []
-                for (a, b), w in weights_for_z.items():
-                    ia = idx.get(a)
-                    ib = idx.get(b)
-                    if ia is None or ib is None:
-                        continue
-                    dists.append(abs(float(z[ia] - z[ib])))
-                last_sigma = (float(np.median(dists)) + 1e-6) if dists else 1.0
-            else:
-                last_sigma = float(sigma)
+            if verbose and method in ("spectral", "spectral_shuffled") and batch_id == 0:
+                print(f"[{method}] sigma({sigma_mode})={last_sigma:.4f} (sigma_mult={sigma_mult:g}, coh_gamma={coh_gamma:g})")
         else:
             vocab_list = last_vocab_list if last_vocab_list is not None else sorted(vocab)
             z = last_z
-            last_sigma = last_sigma if last_sigma is not None else (float(sigma) if sigma > 0 else 1.0)
+            if last_sigma is None:
+                # Fallback (should be rare): respect fixed/auto choice and sigma_mult.
+                if sigma > 0:
+                    last_sigma = float(sigma) * float(sigma_mult)
+                    last_sigma_mode = "fixed"
+                else:
+                    last_sigma = 1.0 * float(sigma_mult)
+                    last_sigma_mode = "auto"
 
         idx_map = {t: i for i, t in enumerate(vocab_list)} if (need_z and z is not None) else {}
 
@@ -459,7 +494,7 @@ def train_batched_bpe(
                         continue
                     dz = float(z[ia] - z[ib])
                     # Gaussian coherence kernel: exp(-||dz||^2 / (2*sigma^2))
-                    coh = math.exp(-(dz * dz) / (2.0 * last_sigma * last_sigma))
+                    coh = math.exp(-(float(coh_gamma) * dz * dz) / (2.0 * last_sigma * last_sigma))
                     score *= coh
             if score > 0:
                 scored.append((score, (a, b)))
@@ -544,6 +579,10 @@ def train_batched_bpe(
         merge_logs=logs,
         z_snapshot=first_z if first_z is not None else last_z,
         vocab_snapshot=first_vocab_list if first_vocab_list is not None else last_vocab_list,
+        effective_sigma=float(last_sigma) if last_sigma is not None else None,
+        sigma_mode=last_sigma_mode,
+        sigma_mult=float(sigma_mult),
+        coh_gamma=float(coh_gamma),
     )
 
 
@@ -1170,6 +1209,8 @@ def run_toy_stage(args) -> Dict[str, Any]:
             tau=args.tau,
             alpha=args.alpha,
             sigma=args.sigma,
+            sigma_mult=args.sigma_mult,
+            coh_gamma=args.coh_gamma,
             recompute_every=args.recompute_every,
             shuffle_seed=args.shuffle_seed if args.shuffle_seed >= 0 else args.seed,
             stem_set=stem_set,
@@ -1366,6 +1407,8 @@ def run_real_lm_stage(args) -> Optional[Dict[str, Any]]:
             tau=args.tau,
             alpha=args.alpha,
             sigma=args.real_sigma,
+            sigma_mult=args.real_sigma_mult,
+            coh_gamma=args.real_coh_gamma,
             recompute_every=args.recompute_every,
             shuffle_seed=args.shuffle_seed if args.shuffle_seed >= 0 else args.seed,
             stem_set=None,
@@ -1427,11 +1470,18 @@ def run_real_lm_stage(args) -> Optional[Dict[str, Any]]:
         else:
             # Fixed token compute: same seq_len for all tokenizers.
             seq_len = args.lm_seq_len
-        print(f"[{m}] tokens/byte={tokens_per_byte:.3f} -> seq_len={seq_len} (mode={args.lm_seq_len_mode}, byte_span={args.lm_byte_span})")
+        bytes_per_seq = float(seq_len) / max(1e-9, tokens_per_byte)
+        print(f"[{m}] tokens/byte={tokens_per_byte:.3f} -> seq_len={seq_len} (mode={args.lm_seq_len_mode}, target_byte_span={args.lm_byte_span}, effective_bytes/seq≈{bytes_per_seq:.0f})")
 
         # Affix boundary metric
         enc = make_bpe_encoder(trained[m].merges)
-        probe_met = evaluate_boundary_f1(probe_samples, enc) if probe_samples else {"boundary_acc": 0.0, "f1": 0.0}
+        probe_met = evaluate_boundary_f1(probe_samples, enc) if probe_samples else {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "boundary_acc": 0.0,
+            "avg_tokens_per_word": 0.0,
+        }
 
         # Micro-LM
         lm_met = train_micro_lm_bits_per_byte(
@@ -1451,32 +1501,47 @@ def run_real_lm_stage(args) -> Optional[Dict[str, Any]]:
             eval_batches=args.lm_eval_batches,
         )
 
+        bits_per_token = float(lm_met["val_loss_nats_per_token"] / math.log(2.0))
+
         real_metrics[m] = {
             "vocab_size": vocab_size,
             "train_tokens": len(train_ids),
             "val_tokens": len(val_ids),
             "val_bytes": val_bytes,
             "seq_len": seq_len,
+            "effective_bytes_per_seq": bytes_per_seq,
+            "bits_per_token": bits_per_token,
+            "probe_precision": probe_met["precision"],
+            "probe_recall": probe_met["recall"],
             "probe_boundary_acc": probe_met["boundary_acc"],
             "probe_boundary_f1": probe_met["f1"],
+            "tokenizer_sigma": trained[m].effective_sigma,
+            "tokenizer_sigma_mode": trained[m].sigma_mode,
+            "tokenizer_sigma_mult": trained[m].sigma_mult,
+            "tokenizer_coh_gamma": trained[m].coh_gamma,
             **lm_met,
         }
         real_rows.append([
             m,
             vocab_size,
             f"{lm_met['tokens_per_byte']:.3f}",
+            f"{bits_per_token:.3f}",
             f"{lm_met['bits_per_byte']:.3f}",
-            f"{probe_met['boundary_acc']:.3f}",
+            f"{bytes_per_seq:.0f}",
+            f"{probe_met['precision']:.3f}",
+            f"{probe_met['recall']:.3f}",
             f"{probe_met['f1']:.3f}",
         ])
 
     print("\nReal-text summary:")
-    print(pretty_table(real_rows, headers=["method", "vocab", "tokens/byte", "bits/byte (lower better)", "probe_acc", "probe_F1"]))
+    print(pretty_table(real_rows, headers=["method", "vocab", "tokens/byte", "bits/token", "bits/byte (lower better)", "bytes/seq", "probe_P", "probe_R", "probe_F1"]))
 
     out = {"real": {"config": {
         "real_vocab_size": args.real_vocab_size,
         "real_batch_size": args.real_batch_size,
         "real_sigma": args.real_sigma,
+        "real_sigma_mult": args.real_sigma_mult,
+        "real_coh_gamma": args.real_coh_gamma,
         "shuffle_seed": args.shuffle_seed if args.shuffle_seed >= 0 else args.seed,
         "lm_steps": args.lm_steps,
         "lm_batch_size": args.lm_batch_size,
@@ -1508,6 +1573,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--alpha", type=float, default=0.0, help="extra exponent on counts: score uses N(i,j)^(1+alpha)*PPMI; alpha=0 matches paper")
     p.add_argument("--sigma", type=float, default=0.2, help="<=0 => auto sigma from median |z_i-z_j|")
     p.add_argument("--real_sigma", type=float, default=0.0, help="sigma for real-text spectral methods (<=0 => auto from median |z_i-z_j|)")
+    p.add_argument("--sigma_mult", type=float, default=1.0, help="multiplies sigma after (optional) auto-estimation; >1 makes coherence weaker")
+    p.add_argument("--real_sigma_mult", type=float, default=1.0, help="like --sigma_mult but for real-text stage")
+    p.add_argument("--coh_gamma", type=float, default=1.0, help="coherence strength: exp(-gamma*dz^2/(2*sigma^2)); <1 weaker, >1 stronger")
+    p.add_argument("--real_coh_gamma", type=float, default=1.0, help="like --coh_gamma but for real-text stage")
     p.add_argument("--recompute_every", type=int, default=1)
 
     # Toy dataset
