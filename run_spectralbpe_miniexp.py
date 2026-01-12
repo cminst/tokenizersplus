@@ -400,11 +400,10 @@ def train_batched_bpe(
             vocab_list = sorted(vocab)
             weights_for_z: Dict[Tuple[str, str], float] = {}
             if ppmi:
+                # Paper-style: build the Laplacian from association weights only (PPMI).
+                # Raw counts enter the merge score separately.
                 for (a, b), pp in ppmi.items():
-                    nij = pair_counts.get((a, b), 0)
-                    if nij <= 0:
-                        continue
-                    weights_for_z[(a, b)] = float(pp) * float(nij ** alpha)
+                    weights_for_z[(a, b)] = float(pp)
             z = compute_fiedler_embedding(vocab_list, weights_for_z)
             if method == "spectral_shuffled":
                 if shuffle_seed is None:
@@ -450,14 +449,17 @@ def train_batched_bpe(
                 if method == "pmi_only":
                     score = pp
                 else:
-                    score = pp * float(nij ** alpha)
+                    # Paper-style count weighting: N(i,j) * W_ij, with optional extra exponent alpha.
+                    # alpha=0 => exactly N(i,j)*PPMI(i,j).
+                    score = pp * float(nij) * float(nij ** alpha)
                 if method in ("spectral", "spectral_shuffled"):
                     ia = idx_map.get(a)
                     ib = idx_map.get(b)
                     if ia is None or ib is None or z is None:
                         continue
                     dz = float(z[ia] - z[ib])
-                    coh = math.exp(-(dz * dz) / (last_sigma * last_sigma))
+                    # Gaussian coherence kernel: exp(-||dz||^2 / (2*sigma^2))
+                    coh = math.exp(-(dz * dz) / (2.0 * last_sigma * last_sigma))
                     score *= coh
             if score > 0:
                 scored.append((score, (a, b)))
@@ -1032,6 +1034,12 @@ def train_micro_lm_bits_per_byte(
         opt.step()
 
     # eval
+    # Reset RNG before evaluation so eval batches are reproducible and not affected by training RNG consumption.
+    eval_seed = int(seed) + 1_000_003
+    torch.manual_seed(eval_seed)
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.manual_seed_all(eval_seed)
+
     model.eval()
     losses = []
     with torch.no_grad():
@@ -1357,7 +1365,7 @@ def run_real_lm_stage(args) -> Optional[Dict[str, Any]]:
             batch_size=args.real_batch_size,
             tau=args.tau,
             alpha=args.alpha,
-            sigma=args.sigma,
+            sigma=args.real_sigma,
             recompute_every=args.recompute_every,
             shuffle_seed=args.shuffle_seed if args.shuffle_seed >= 0 else args.seed,
             stem_set=None,
@@ -1413,12 +1421,13 @@ def run_real_lm_stage(args) -> Optional[Dict[str, Any]]:
         vocab_list = sorted(trained[m].vocab)
         vocab_size = len(vocab_list)
         tokens_per_byte = float(len(val_ids) / max(1, val_bytes))
-        if args.lm_byte_span > 0:
+        if args.lm_seq_len_mode == "byte_span" and args.lm_byte_span > 0:
             seq_len = int(round(args.lm_byte_span * tokens_per_byte))
             seq_len = max(args.lm_seq_len_min, min(args.lm_seq_len_max, seq_len))
         else:
+            # Fixed token compute: same seq_len for all tokenizers.
             seq_len = args.lm_seq_len
-        print(f"[{m}] tokens/byte={tokens_per_byte:.3f} -> seq_len={seq_len} (byte_span={args.lm_byte_span})")
+        print(f"[{m}] tokens/byte={tokens_per_byte:.3f} -> seq_len={seq_len} (mode={args.lm_seq_len_mode}, byte_span={args.lm_byte_span})")
 
         # Affix boundary metric
         enc = make_bpe_encoder(trained[m].merges)
@@ -1467,9 +1476,11 @@ def run_real_lm_stage(args) -> Optional[Dict[str, Any]]:
     out = {"real": {"config": {
         "real_vocab_size": args.real_vocab_size,
         "real_batch_size": args.real_batch_size,
+        "real_sigma": args.real_sigma,
         "shuffle_seed": args.shuffle_seed if args.shuffle_seed >= 0 else args.seed,
         "lm_steps": args.lm_steps,
         "lm_batch_size": args.lm_batch_size,
+        "lm_seq_len_mode": args.lm_seq_len_mode,
         "lm_seq_len": args.lm_seq_len,
         "lm_byte_span": args.lm_byte_span,
         "lm_seq_len_min": args.lm_seq_len_min,
@@ -1494,8 +1505,9 @@ def parse_args() -> argparse.Namespace:
 
     # Shared method params
     p.add_argument("--tau", type=int, default=2)
-    p.add_argument("--alpha", type=float, default=0.5)
+    p.add_argument("--alpha", type=float, default=0.0, help="extra exponent on counts: score uses N(i,j)^(1+alpha)*PPMI; alpha=0 matches paper")
     p.add_argument("--sigma", type=float, default=0.2, help="<=0 => auto sigma from median |z_i-z_j|")
+    p.add_argument("--real_sigma", type=float, default=0.0, help="sigma for real-text spectral methods (<=0 => auto from median |z_i-z_j|)")
     p.add_argument("--recompute_every", type=int, default=1)
 
     # Toy dataset
@@ -1529,6 +1541,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="cuda" if os.environ.get("CUDA_VISIBLE_DEVICES", "") != "" else "cpu")
 
     # Micro-LM config
+    p.add_argument("--lm_seq_len_mode", type=str, default="fixed", choices=["fixed", "byte_span"], help="fixed: use --lm_seq_len for all tokenizers (matched token compute). byte_span: set seq_len≈lm_byte_span*tokens_per_byte")
     p.add_argument("--lm_steps", type=int, default=1200)
     p.add_argument("--lm_batch_size", type=int, default=64)
     p.add_argument("--lm_seq_len", type=int, default=128)
