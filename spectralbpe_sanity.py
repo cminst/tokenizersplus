@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-# LM-free sanity-check: compare standard frequency-BPE vs SpectralBPE on intrinsic tokenizer metrics
+# Sanity-check: compare standard frequency-BPE vs SpectralBPE on intrinsic tokenizer metrics
 # (bytes/token, fertility, PCW, NSL vs BPE) + a small interpretability dump.
+# Optional: train a tiny LM for a generalization test (requires torch).
 #
 # Requirements:
 #   pip install numpy scipy
+#   pip install torch  # only needed for --train_lm
 
 from __future__ import annotations
 
@@ -13,6 +15,7 @@ import math
 import random
 import re
 import sys
+import time
 from collections import Counter, defaultdict
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Set, Any
 
@@ -451,7 +454,7 @@ def merge_once(tokens: Sequence[str], pair: Tuple[str, str]) -> List[str]:
     return out
 
 
-def encode_word(word: str, rank: Dict[Tuple[str, str], int]) -> List[str]:
+def encode_word(word: str, rank: Dict[Tuple[str, str], int], keep_end: bool = False) -> List[str]:
     if not word:
         return []
     toks = list(word)
@@ -469,7 +472,7 @@ def encode_word(word: str, rank: Dict[Tuple[str, str], int]) -> List[str]:
         if best is None:
             break
         toks = merge_once(toks, best)
-    return strip_end(toks)
+    return toks if keep_end else strip_end(toks)
 
 
 # ---------- Metrics ----------
@@ -646,6 +649,171 @@ def interpretability(
     print(f"  SpectralBPE: {ss}")
 
 
+# ---------- LM Generalization (optional) ----------
+def tokens_from_lines(
+    lines: Sequence[str],
+    merges: List[Tuple[str, str]],
+    pre_mode: str,
+    lowercase: bool,
+) -> Tuple[List[str], List[int]]:
+    rank = {p: i for i, p in enumerate(merges)}
+    tokens: List[str] = []
+    lengths: List[int] = []
+    for line in lines:
+        if lowercase:
+            line = line.lower()
+        line_tokens: List[str] = []
+        for w in pretokenize(line, pre_mode):
+            if not w:
+                continue
+            line_tokens.extend(encode_word(w, rank))
+        if line_tokens:
+            lengths.append(len(line_tokens))
+            tokens.extend(line_tokens)
+    return tokens, lengths
+
+
+def build_vocab(tokens: Sequence[str]) -> Tuple[List[str], Dict[str, int]]:
+    uniq = [t for t in sorted(set(tokens)) if t != "<unk>"]
+    vocab = ["<unk>"] + uniq
+    stoi = {t: i for i, t in enumerate(vocab)}
+    return vocab, stoi
+
+
+def iter_lm_batches(
+    ids_tensor,
+    block_size: int,
+    batch_size: int,
+    rng: Optional[random.Random],
+):
+    n = int(ids_tensor.shape[0])
+    num_blocks = (n - 1) // block_size
+    if num_blocks <= 0:
+        return
+    starts = list(range(0, num_blocks * block_size, block_size))
+    if rng is not None:
+        rng.shuffle(starts)
+    for i in range(0, len(starts), batch_size):
+        batch_starts = starts[i:i + batch_size]
+        x = np.stack([ids_tensor[s:s + block_size] for s in batch_starts], axis=0)
+        y = np.stack([ids_tensor[s + 1:s + block_size + 1] for s in batch_starts], axis=0)
+        yield x, y
+
+
+def train_and_eval_lm(
+    train_lines: Sequence[str],
+    eval_lines: Sequence[str],
+    merges: List[Tuple[str, str]],
+    pre_mode: str,
+    lowercase: bool,
+    eval_bytes: int,
+    epochs: int,
+    batch_size: int,
+    block_size: int,
+    n_embd: int,
+    n_head: int,
+    n_layer: int,
+    lr: float,
+    seed: int,
+) -> Tuple[float, float, float]:
+    try:
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+    except Exception as e:
+        raise RuntimeError("Torch is required for --train_lm. Install: pip install torch") from e
+
+    train_tokens, _ = tokens_from_lines(train_lines, merges, pre_mode, lowercase)
+    eval_tokens, eval_lengths = tokens_from_lines(eval_lines, merges, pre_mode, lowercase)
+    avg_seq_len = (sum(eval_lengths) / len(eval_lengths)) if eval_lengths else 0.0
+
+    if len(train_tokens) < block_size + 1:
+        raise RuntimeError("Not enough training tokens for the requested --lm_block_size.")
+
+    vocab, stoi = build_vocab(train_tokens)
+    unk_id = stoi["<unk>"]
+    train_ids = np.array([stoi.get(t, unk_id) for t in train_tokens], dtype=np.int64)
+    eval_ids = np.array([stoi.get(t, unk_id) for t in eval_tokens], dtype=np.int64)
+
+    device = torch.device("cpu")
+    torch.manual_seed(seed)
+    random.seed(seed)
+
+    class MiniTransformerLM(nn.Module):
+        def __init__(self, vocab_size: int):
+            super().__init__()
+            self.token_emb = nn.Embedding(vocab_size, n_embd)
+            self.pos_emb = nn.Embedding(block_size, n_embd)
+            enc_layer = nn.TransformerEncoderLayer(
+                d_model=n_embd,
+                nhead=n_head,
+                dim_feedforward=4 * n_embd,
+                dropout=0.1,
+                batch_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layer)
+            self.ln = nn.LayerNorm(n_embd)
+            self.head = nn.Linear(n_embd, vocab_size, bias=False)
+
+        def forward(self, idx):
+            bsz, t = idx.shape
+            pos = torch.arange(t, device=idx.device).unsqueeze(0)
+            x = self.token_emb(idx) + self.pos_emb(pos)
+            mask = torch.triu(torch.ones(t, t, device=idx.device), diagonal=1).bool()
+            x = self.encoder(x, mask)
+            x = self.ln(x)
+            return self.head(x)
+
+    model = MiniTransformerLM(len(vocab)).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+
+    model.train()
+    t0 = time.perf_counter()
+    for epoch in range(epochs):
+        rng = random.Random(seed + epoch)
+        for x_np, y_np in iter_lm_batches(train_ids, block_size, batch_size, rng):
+            x = torch.from_numpy(x_np).to(device)
+            y = torch.from_numpy(y_np).to(device)
+            logits = model(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+    train_time = time.perf_counter() - t0
+
+    model.eval()
+    eval_block_size = min(block_size, len(eval_ids) - 1) if len(eval_ids) > 1 else 0
+    if eval_block_size <= 0:
+        raise RuntimeError("Not enough evaluation tokens for LM evaluation.")
+
+    total_loss = 0.0
+    with torch.no_grad():
+        for x_np, y_np in iter_lm_batches(eval_ids, eval_block_size, batch_size, None):
+            x = torch.from_numpy(x_np).to(device)
+            y = torch.from_numpy(y_np).to(device)
+            logits = model(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), reduction="sum")
+            total_loss += float(loss.item())
+
+    if eval_bytes <= 0:
+        bpb = float("nan")
+    else:
+        bpb = (total_loss / float(eval_bytes)) / math.log(2.0)
+
+    return bpb, avg_seq_len, train_time
+
+
+def print_lm_table(bpe_res: Tuple[float, float, float], sp_res: Tuple[float, float, float]) -> None:
+    b_bpb, b_seq, b_time = bpe_res
+    s_bpb, s_seq, s_time = sp_res
+    print("\n== LM generalization (BPB) ==")
+    print(f"{'Metric':24s} | {'BPE':>12s} | {'SpectralBPE':>12s}")
+    print("-" * 56)
+    print(f"{'BPB (eval)':24s} | {b_bpb:12.6f} | {s_bpb:12.6f}")
+    print(f"{'Avg tokens/sent':24s} | {b_seq:12.2f} | {s_seq:12.2f}")
+    print(f"{'Training time (s)':24s} | {b_time:12.2f} | {s_time:12.2f}")
+
+
 # ---------- Main ----------
 def main():
     ap = argparse.ArgumentParser()
@@ -673,6 +841,16 @@ def main():
     ap.add_argument("--deterministic_ties", action="store_true", help="Disable random shuffle of equal-score ties")
     ap.add_argument("--bpe_warmstart", type=int, default=0, help="Number of plain BPE merges before spectral guidance")
     ap.add_argument("--num_seeds", type=int, default=1, help="Run with multiple seeds and report stats")
+
+    # Optional LM generalization test
+    ap.add_argument("--train_lm", action="store_true", help="Train a tiny LM and report BPB on eval.txt")
+    ap.add_argument("--lm_epochs", type=int, default=2)
+    ap.add_argument("--lm_batch_size", type=int, default=16)
+    ap.add_argument("--lm_block_size", type=int, default=128)
+    ap.add_argument("--lm_dim", type=int, default=128)
+    ap.add_argument("--lm_heads", type=int, default=4)
+    ap.add_argument("--lm_layers", type=int, default=2)
+    ap.add_argument("--lm_lr", type=float, default=3e-4)
 
     ap.add_argument("--out_json", type=str, default=None)
     args = ap.parse_args()
@@ -754,12 +932,71 @@ def main():
     print_table(bpe_metrics, sp_metrics)
     interpretability(bpe_merges, sp_merges, ex_b, ex_s, debug, sigma=args.sigma if not args.sigma_auto else debug.get("auto_sigma", args.sigma))
 
+    lm_results = None
+    if args.train_lm:
+        if args.max_eval_lines is None:
+            try:
+                eval_bytes = len(open(args.eval_text, "rb").read())
+            except Exception:
+                eval_bytes = sum(len((line + "\n").encode("utf-8", errors="ignore")) for line in eval_lines)
+        else:
+            eval_bytes = sum(len((line + "\n").encode("utf-8", errors="ignore")) for line in eval_lines)
+
+        print("\n[train] LM on BPE tokens...", file=sys.stderr)
+        bpe_lm = train_and_eval_lm(
+            train_lines,
+            eval_lines,
+            bpe_merges,
+            args.pretokenize,
+            args.lowercase,
+            eval_bytes=eval_bytes,
+            epochs=args.lm_epochs,
+            batch_size=args.lm_batch_size,
+            block_size=args.lm_block_size,
+            n_embd=args.lm_dim,
+            n_head=args.lm_heads,
+            n_layer=args.lm_layers,
+            lr=args.lm_lr,
+            seed=args.seed,
+        )
+
+        print("[train] LM on SpectralBPE tokens...", file=sys.stderr)
+        sp_lm = train_and_eval_lm(
+            train_lines,
+            eval_lines,
+            sp_merges,
+            args.pretokenize,
+            args.lowercase,
+            eval_bytes=eval_bytes,
+            epochs=args.lm_epochs,
+            batch_size=args.lm_batch_size,
+            block_size=args.lm_block_size,
+            n_embd=args.lm_dim,
+            n_head=args.lm_heads,
+            n_layer=args.lm_layers,
+            lr=args.lm_lr,
+            seed=args.seed,
+        )
+
+        print_lm_table(bpe_lm, sp_lm)
+        lm_results = {"bpe": bpe_lm, "spectralbpe": sp_lm, "eval_bytes": eval_bytes}
+
     if args.out_json:
         payload = {
             "config": vars(args),
             "metrics": {"bpe": bpe_metrics, "spectralbpe": sp_metrics},
             "num_merges": {"bpe": len(bpe_merges), "spectralbpe": len(sp_merges)},
         }
+        if lm_results is not None:
+            payload["lm"] = {
+                "bpe_bpb": lm_results["bpe"][0],
+                "bpe_avg_seq_len": lm_results["bpe"][1],
+                "bpe_train_time_sec": lm_results["bpe"][2],
+                "spectral_bpb": lm_results["spectralbpe"][0],
+                "spectral_avg_seq_len": lm_results["spectralbpe"][1],
+                "spectral_train_time_sec": lm_results["spectralbpe"][2],
+                "eval_bytes": lm_results["eval_bytes"],
+            }
         with open(args.out_json, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
         print(f"[out] wrote {args.out_json}", file=sys.stderr)
