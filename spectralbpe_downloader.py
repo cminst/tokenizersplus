@@ -2,6 +2,7 @@
 # pip install datasets
 
 import argparse
+from pathlib import Path
 from datasets import load_dataset
 
 def write_split(ds, split_name: str, out_path: str, max_lines: int | None):
@@ -27,15 +28,30 @@ def main():
                     help="wikitext-103-raw-v1 (bigger) or wikitext-2-raw-v1 (smaller)")
     ap.add_argument("--max_train_lines", type=int, default=None)
     ap.add_argument("--max_eval_lines", type=int, default=None)
+    ap.add_argument("--data_root", default="data",
+                    help="Directory to place output files when paths are relative")
     ap.add_argument("--out_train", default="train.txt")
     ap.add_argument("--out_eval", default="eval.txt")
     args = ap.parse_args()
 
+    def resolve_out(path_str: str, data_root: str) -> Path:
+        path = Path(path_str).expanduser()
+        if not path.is_absolute():
+            path = Path(data_root).expanduser() / path
+        return path.resolve()
+
+    out_train = resolve_out(args.out_train, args.data_root)
+    out_eval = resolve_out(args.out_eval, args.data_root)
+
+    # Ensure output directory exists.
+    out_train.parent.mkdir(parents=True, exist_ok=True)
+    out_eval.parent.mkdir(parents=True, exist_ok=True)
+
     # Dataset is hosted under Salesforce/wikitext on HF
     ds = load_dataset("Salesforce/wikitext", args.config)  # splits: train, validation, test
 
-    write_split(ds, "train", args.out_train, args.max_train_lines)
-    write_split(ds, "validation", args.out_eval, args.max_eval_lines)
+    write_split(ds, "train", str(out_train), args.max_train_lines)
+    write_split(ds, "validation", str(out_eval), args.max_eval_lines)
 
 if __name__ == "__main__":
     main()
