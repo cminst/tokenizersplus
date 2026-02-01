@@ -32,3 +32,5 @@ benchmark/results/
 uv.lock
 *.tex
 
+
+data/*
