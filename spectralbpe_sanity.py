@@ -146,13 +146,15 @@ def sym_key(a: str, b: str) -> Tuple[str, str]:
 
 
 def ppmi_and_weights(
-    N_dir: Counter, tau: int, alpha: float
+    N_dir: Counter, tau: int, alpha: float, beta: float = 0.0
 ) -> Tuple[Dict[Tuple[str, str], float], Dict[Tuple[str, str], float], Dict[Tuple[str, str], float]]:
     """
     From directed adjacency counts N(i,j), compute:
       ppmi_dir[(i,j)] = max(0, log p(i,j) / (p(i)p(j)) )
-      W_dir[(i,j)]    = 1{N>=tau} * ppmi_dir * N^alpha   (for merge scoring)
+      W_dir[(i,j)]    = 1{N>=tau} * (ppmi_dir + beta) * N^alpha   (for merge scoring)
       W_und[{i,j}]    = W_dir(i,j) + W_dir(j,i)          (for spectral embedding)
+
+    beta: baseline added to PPMI to prevent hard gating (beta=0 recovers original behavior)
     """
     total = float(sum(N_dir.values()))
     if total <= 0:
@@ -180,8 +182,9 @@ def ppmi_and_weights(
         ppmi = max(0.0, pmi)
         ppmi_dir[(a, b)] = ppmi
 
-        if c >= tau and ppmi > 0.0:
-            w = ppmi * (float(c) ** alpha)
+        if c >= tau:
+            ppmi_eff = ppmi + beta
+            w = ppmi_eff * (float(c) ** alpha)
             W_dir[(a, b)] = w
             W_und[sym_key(a, b)] += w
 
@@ -190,45 +193,94 @@ def ppmi_and_weights(
 
 def fiedler(tokens: List[str], W_und: Dict[Tuple[str, str], float], eig_k: int, eig_eps: float) -> Dict[str, float]:
     n = len(tokens)
-    if n == 0:
-        return {}
-    if n == 1:
-        return {tokens[0]: 0.0}
+    if n <= 1:
+        return {t: 0.0 for t in tokens}
 
+    # 1. Build Adjacency Matrix
     idx = {t: i for i, t in enumerate(tokens)}
     rows, cols, data = [], [], []
     for (a, b), w in W_und.items():
-        if a not in idx or b not in idx:
-            continue
-        i, j = idx[a], idx[b]
-        if i == j:
-            continue
-        rows += [i, j]
-        cols += [j, i]
-        data += [w, w]
+        if a in idx and b in idx and a != b:
+            i, j = idx[a], idx[b]
+            rows.append(i); cols.append(j); data.append(w)
+            rows.append(j); cols.append(i); data.append(w)
+
+    if not data:
+        return {t: 0.0 for t in tokens}
+
     A = csr_matrix((data, (rows, cols)), shape=(n, n), dtype=np.float64)
 
-    deg = np.asarray(A.sum(axis=1)).ravel()
-    inv_sqrt = np.zeros_like(deg)
-    inv_sqrt[deg > 0] = 1.0 / np.sqrt(deg[deg > 0])
-    L = identity(n, format="csr") - (diags(inv_sqrt) @ A @ diags(inv_sqrt))
+    # 2. Extract Largest Connected Component (LCC)
+    # Spectral geometry is only defined within a component.
+    # Distances between components are infinite/undefined.
+    from scipy.sparse.csgraph import connected_components
+    n_components, labels = connected_components(csgraph=A, directed=False, return_labels=True)
 
-    k = min(eig_k, n - 1) if n > 2 else 1
-    vals, vecs = eigsh(L, k=k, which="SM")
-    order = np.argsort(vals)
-    vals, vecs = vals[order], vecs[:, order]
-    j = 0
-    while j < len(vals) and vals[j] <= eig_eps:
-        j += 1
-    j = min(j, vecs.shape[1] - 1)
-    v = vecs[:, j]
-    return {t: float(v[i]) for i, t in enumerate(tokens)}
+    # If fragmented, only solve for the largest chunk
+    counts = Counter(labels)
+    largest_cc_label = counts.most_common(1)[0][0]
+    lcc_indices = np.where(labels == largest_cc_label)[0]
+
+    if len(lcc_indices) < 2:
+        return {t: 0.0 for t in tokens}
+
+    # Create sub-matrix for LCC
+    A_lcc = A[lcc_indices][:, lcc_indices]
+    n_lcc = A_lcc.shape[0]
+
+    # 3. Compute Laplacian for LCC
+    deg = np.asarray(A_lcc.sum(axis=1)).ravel()
+    # Add epsilon to degree to prevent div/0 in degenerate cases
+    deg[deg == 0] = 1e-10
+    inv_sqrt = 1.0 / np.sqrt(deg)
+    D_inv_sqrt = diags(inv_sqrt)
+    L = identity(n_lcc, format="csr") - (D_inv_sqrt @ A_lcc @ D_inv_sqrt)
+
+    # 4. Robust Eigensolve
+    # We only need the first non-trivial vector.
+    # Since we isolated LCC, the only 0 eigenvalue is the first one.
+    # We want the second one (Fiedler).
+    k_target = min(eig_k, n_lcc - 1) if n_lcc > 2 else 1
+
+    try:
+        # 'SA' (Smallest Algebraic) is often more stable than 'SM' for Laplacians
+        # We ask for k+1 to safely skip the null vector
+        vals, vecs = eigsh(L, k=k_target+1, which="SA", tol=eig_eps)
+
+        # Sort and pick the first vector that is definitely non-zero
+        order = np.argsort(vals)
+        vals, vecs = vals[order], vecs[:, order]
+
+        # Skip eigenvalues near zero (tolerance 1e-5 usually safe for normalized laplacian)
+        sel = 0
+        while sel < len(vals) and vals[sel] < 1e-5:
+            sel += 1
+
+        if sel < len(vals):
+            v_lcc = vecs[:, sel]
+        else:
+            # Fallback if solver returns all zeros
+            v_lcc = np.zeros(n_lcc)
+
+    except Exception as e:
+        print(f"[WARNING] Solver failed on LCC (size {n_lcc}): {e}", file=sys.stderr)
+        v_lcc = np.zeros(n_lcc)
+
+    # 5. Map back to tokens
+    # Tokens outside LCC get 0.0 embedding (neutral)
+    z_map = {t: 0.0 for t in tokens}
+    for local_idx, global_idx in enumerate(lcc_indices):
+        z_map[tokens[global_idx]] = float(v_lcc[local_idx])
+
+    return z_map
 
 
-def select_conflict_free(scored: List[Tuple[float, Tuple[str, str]]], batch_size: int, rng: random.Random) -> List[Tuple[str, str]]:
+def select_conflict_free(scored: List[Tuple[float, Tuple[str, str]]], batch_size: int, rng: random.Random, deterministic: bool = False) -> List[Tuple[str, str]]:
     """
     Conservative 'conflict-free' selection:
       no token type can appear in more than one selected pair within the batch.
+
+    deterministic: if True, skip the random shuffle of equal-score ties
     """
     selected: List[Tuple[str, str]] = []
     used: Set[str] = set()
@@ -239,7 +291,8 @@ def select_conflict_free(scored: List[Tuple[float, Tuple[str, str]]], batch_size
         while j < len(scored) and scored[j][0] == s0:
             j += 1
         group = scored[i:j]
-        rng.shuffle(group)
+        if not deterministic:
+            rng.shuffle(group)
         for _, (a, b) in group:
             if len(selected) >= batch_size:
                 break
@@ -263,6 +316,10 @@ def train_spectral_bpe(
     eig_eps: float,
     seed: int,
     max_merges: Optional[int],
+    beta: float = 0.0,
+    sigma_auto: bool = False,
+    deterministic_ties: bool = False,
+    bpe_warmstart: int = 0,
 ) -> Tuple[List[Tuple[str, str]], Dict[str, Any]]:
     rng = random.Random(seed)
     vocab = init_vocab(word_freq)
@@ -273,32 +330,67 @@ def train_spectral_bpe(
 
     # Debug: initial graph stats for interpretability
     init_dir = pair_counts(vocab)
-    init_ppmi_dir, _, init_W_und = ppmi_and_weights(init_dir, tau, alpha)
+    init_ppmi_dir, _, init_W_und = ppmi_and_weights(init_dir, tau, alpha, beta)
     init_tokens = sorted(symbol_set(vocab))
     init_z = fiedler(init_tokens, init_W_und, eig_k=eig_k, eig_eps=eig_eps)
     debug = {"init_dir": init_dir, "init_ppmi_dir": init_ppmi_dir, "init_z": init_z}
 
     merges: List[Tuple[str, str]] = []
+
+    # BPE warm-start: run plain BPE for first N merges
+    if bpe_warmstart > 0:
+        print(f"[SpectralBPE] warm-start: running {bpe_warmstart} BPE merges first", file=sys.stderr)
+        warmstart_target = min(bpe_warmstart, target)
+        while len(merges) < warmstart_target:
+            N_dir = pair_counts(vocab)
+            if not N_dir:
+                break
+            best_pair = max(N_dir.items(), key=lambda x: x[1])[0]
+            vocab = apply_merge(vocab, best_pair)
+            merges.append(best_pair)
+        print(f"[SpectralBPE] warm-start complete: {len(merges)} merges done", file=sys.stderr)
+
+    # Auto-calibrate sigma if requested
+    if sigma_auto:
+        N_dir = pair_counts(vocab)
+        _, _, W_und = ppmi_and_weights(N_dir, tau, alpha, beta)
+        tokens = sorted(symbol_set(vocab))
+        z = fiedler(tokens, W_und, eig_k=eig_k, eig_eps=eig_eps)
+        dz_vals = []
+        for (a, b) in N_dir.keys():
+            if a in z and b in z:
+                dz_vals.append(abs(z[a] - z[b]))
+        if dz_vals:
+            sigma = float(np.percentile(dz_vals, 75))
+            print(f"[SpectralBPE] auto-calibrated sigma = {sigma:.4f} (p75 of |dz|)", file=sys.stderr)
+        else:
+            sigma = 1.0
+            print("[SpectralBPE] auto-calibration failed, using sigma = 1.0", file=sys.stderr)
+        debug["auto_sigma"] = sigma
+
     sigma2 = float(sigma) ** 2
 
     outer = 0
+    coherence_stats = []
     while len(merges) < max(0, target):
         outer += 1
         N_dir = pair_counts(vocab)
         if not N_dir:
             break
 
-        _, W_dir, W_und = ppmi_and_weights(N_dir, tau, alpha)
+        _, W_dir, W_und = ppmi_and_weights(N_dir, tau, alpha, beta)
         tokens = sorted(symbol_set(vocab))
         z = fiedler(tokens, W_und, eig_k=eig_k, eig_eps=eig_eps)
 
         scored: List[Tuple[float, Tuple[str, str]]] = []
+        coherences = []
         for (a, b), n_ab in N_dir.items():
             w = W_dir.get((a, b), 0.0)
             if w <= 0.0:
                 continue
             dz2 = (z.get(a, 0.0) - z.get(b, 0.0)) ** 2
             coh = math.exp(-dz2 / sigma2) if sigma2 > 0 else 1.0
+            coherences.append(coh)
             s = float(n_ab) * w * coh
             if s > 0 and math.isfinite(s):
                 scored.append((s, (a, b)))
@@ -306,7 +398,7 @@ def train_spectral_bpe(
         if not scored:
             break
         scored.sort(key=lambda x: x[0], reverse=True)
-        batch = select_conflict_free(scored, batch_size=batch_size, rng=rng)
+        batch = select_conflict_free(scored, batch_size=batch_size, rng=rng, deterministic=deterministic_ties)
         if not batch:
             break
 
@@ -316,8 +408,25 @@ def train_spectral_bpe(
             vocab = apply_merge(vocab, pair)
             merges.append(pair)
 
+        # Track coherence statistics
+        if coherences:
+            coherence_stats.append({
+                "outer": outer,
+                "median": float(np.median(coherences)),
+                "p10": float(np.percentile(coherences, 10)),
+                "p90": float(np.percentile(coherences, 90)),
+            })
+
         if outer % 10 == 0:
-            print(f"[SpectralBPE] outer={outer} merges={len(merges)}/{target}", file=sys.stderr)
+            if coherences:
+                coh_median = np.median(coherences)
+                coh_p10 = np.percentile(coherences, 10)
+                coh_p90 = np.percentile(coherences, 90)
+                print(f"[SpectralBPE] outer={outer} merges={len(merges)}/{target} coherence: median={coh_median:.4f} p10={coh_p10:.4f} p90={coh_p90:.4f}", file=sys.stderr)
+            else:
+                print(f"[SpectralBPE] outer={outer} merges={len(merges)}/{target}", file=sys.stderr)
+
+    debug["coherence_stats"] = coherence_stats
 
     return merges, debug
 
@@ -550,13 +659,20 @@ def main():
     ap.add_argument("--max_merges", type=int, default=None)
 
     # SpectralBPE params
-    ap.add_argument("--tau", type=int, default=5)
-    ap.add_argument("--alpha", type=float, default=0.5)
-    ap.add_argument("--sigma", type=float, default=1.0)
+    ap.add_argument("--tau", type=int, default=2, help="Minimum pair count threshold (default: 2, was 5)")
+    ap.add_argument("--alpha", type=float, default=0.25, help="Frequency exponent (default: 0.25, was 0.5)")
+    ap.add_argument("--sigma", type=float, default=1.0, help="Coherence bandwidth (ignored if --sigma_auto)")
     ap.add_argument("--batch_size", type=int, default=25)
     ap.add_argument("--eig_k", type=int, default=8)
     ap.add_argument("--eig_eps", type=float, default=1e-8)
     ap.add_argument("--seed", type=int, default=0)
+
+    # New params for improvements
+    ap.add_argument("--beta", type=float, default=0.05, help="PPMI baseline to avoid hard gating (default: 0.05)")
+    ap.add_argument("--sigma_auto", action="store_true", help="Auto-calibrate sigma from spectral coordinate differences")
+    ap.add_argument("--deterministic_ties", action="store_true", help="Disable random shuffle of equal-score ties")
+    ap.add_argument("--bpe_warmstart", type=int, default=0, help="Number of plain BPE merges before spectral guidance")
+    ap.add_argument("--num_seeds", type=int, default=1, help="Run with multiple seeds and report stats")
 
     ap.add_argument("--out_json", type=str, default=None)
     args = ap.parse_args()
@@ -570,25 +686,73 @@ def main():
     print("[train] BPE...", file=sys.stderr)
     bpe_merges = train_bpe(wf, args.vocab_size, args.max_merges)
 
-    print("[train] SpectralBPE...", file=sys.stderr)
-    sp_merges, debug = train_spectral_bpe(
-        wf,
-        args.vocab_size,
-        tau=args.tau,
-        alpha=args.alpha,
-        sigma=args.sigma,
-        batch_size=args.batch_size,
-        eig_k=args.eig_k,
-        eig_eps=args.eig_eps,
-        seed=args.seed,
-        max_merges=args.max_merges,
-    )
+    # Multi-seed evaluation if requested
+    if args.num_seeds > 1:
+        print(f"[train] SpectralBPE with {args.num_seeds} seeds...", file=sys.stderr)
+        all_sp_metrics = []
+        for seed_i in range(args.num_seeds):
+            current_seed = args.seed + seed_i
+            print(f"[train] SpectralBPE seed {seed_i+1}/{args.num_seeds} (seed={current_seed})...", file=sys.stderr)
+            sp_merges_i, debug_i = train_spectral_bpe(
+                wf,
+                args.vocab_size,
+                tau=args.tau,
+                alpha=args.alpha,
+                sigma=args.sigma,
+                batch_size=args.batch_size,
+                eig_k=args.eig_k,
+                eig_eps=args.eig_eps,
+                seed=current_seed,
+                max_merges=args.max_merges,
+                beta=args.beta,
+                sigma_auto=args.sigma_auto,
+                deterministic_ties=args.deterministic_ties,
+                bpe_warmstart=args.bpe_warmstart,
+            )
+            sp_metrics_i, ex_s_i = evaluate(sp_merges_i, eval_lines, args.pretokenize, args.lowercase)
+            all_sp_metrics.append(sp_metrics_i)
+            if seed_i == 0:
+                sp_merges, debug, ex_s = sp_merges_i, debug_i, ex_s_i
+
+        # Compute mean and std across seeds
+        keys = ["nsl", "bytes_per_token", "tokens_per_byte", "fertility", "pcw"]
+        sp_metrics_mean = {}
+        sp_metrics_std = {}
+        for key in keys:
+            values = [m[key] for m in all_sp_metrics]
+            sp_metrics_mean[key] = float(np.mean(values))
+            sp_metrics_std[key] = float(np.std(values))
+
+        print("\n=== Multi-seed Results ===", file=sys.stderr)
+        print(f"Seeds: {args.num_seeds}", file=sys.stderr)
+        for key in keys:
+            print(f"  {key}: {sp_metrics_mean[key]:.6f} ± {sp_metrics_std[key]:.6f}", file=sys.stderr)
+
+        sp_metrics = all_sp_metrics[0]  # Use first seed for comparison table
+    else:
+        print("[train] SpectralBPE...", file=sys.stderr)
+        sp_merges, debug = train_spectral_bpe(
+            wf,
+            args.vocab_size,
+            tau=args.tau,
+            alpha=args.alpha,
+            sigma=args.sigma,
+            batch_size=args.batch_size,
+            eig_k=args.eig_k,
+            eig_eps=args.eig_eps,
+            seed=args.seed,
+            max_merges=args.max_merges,
+            beta=args.beta,
+            sigma_auto=args.sigma_auto,
+            deterministic_ties=args.deterministic_ties,
+            bpe_warmstart=args.bpe_warmstart,
+        )
+        sp_metrics, ex_s = evaluate(sp_merges, eval_lines, args.pretokenize, args.lowercase)
 
     bpe_metrics, ex_b = evaluate(bpe_merges, eval_lines, args.pretokenize, args.lowercase)
-    sp_metrics, ex_s = evaluate(sp_merges, eval_lines, args.pretokenize, args.lowercase)
 
     print_table(bpe_metrics, sp_metrics)
-    interpretability(bpe_merges, sp_merges, ex_b, ex_s, debug, sigma=args.sigma)
+    interpretability(bpe_merges, sp_merges, ex_b, ex_s, debug, sigma=args.sigma if not args.sigma_auto else debug.get("auto_sigma", args.sigma))
 
     if args.out_json:
         payload = {
