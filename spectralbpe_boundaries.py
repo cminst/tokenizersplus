@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import os
 import sys
@@ -7,8 +8,8 @@ import urllib.request
 from tabulate import tabulate
 
 END_WORD = "</w>"
-DICT_URL = "https://raw.githubusercontent.com/david47k/top-english-wordlists/master/top_english_words_lower_100000.txt"
-DICT_PATH = os.path.join("data", "dictionary.txt")
+LADEC_URL = "https://huggingface.co/datasets/cminst/LADECv1/resolve/main/LADECv1-2019.csv"
+LADEC_PATH = os.path.join("data", "LADECv1-2019.csv")
 
 
 def load_merges(path):
@@ -29,27 +30,15 @@ def load_merges(path):
     return merges
 
 
-def ensure_dictionary(path: str) -> None:
+def ensure_ladec_csv(path: str) -> None:
     if os.path.exists(path):
         return
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with urllib.request.urlopen(DICT_URL) as resp:
-        raw = resp.read().decode("utf-8", errors="ignore").splitlines()
-    words = []
-    for w in raw:
-        w = w.strip().lower()
-        if len(w) >= 3:
-            words.append(w)
+    with urllib.request.urlopen(LADEC_URL) as resp:
+        raw = resp.read()
     with open(path, "w", encoding="utf-8") as f:
-        for w in words:
-            f.write(w + "\n")
-    print(f"[download] wrote {path} ({len(words)} words)", file=sys.stderr)
-
-
-def load_dictionary(path: str) -> set:
-    ensure_dictionary(path)
-    with open(path, "r", encoding="utf-8") as f:
-        return set(x.strip().lower() for x in f if x.strip())
+        f.write(raw.decode("utf-8", errors="ignore"))
+    print(f"[download] wrote {path}", file=sys.stderr)
 
 
 def encode(word, rank):
@@ -112,33 +101,17 @@ def main():
     bpe_rank = {p: i for i, p in enumerate(load_merges(args.bpe))}
     spec_rank = {p: i for i, p in enumerate(load_merges(args.spectral))}
 
-    vocab = load_dictionary(DICT_PATH)
-    print(f"[dict] loaded {len(vocab)} words from {DICT_PATH}", file=sys.stderr)
-
+    ensure_ladec_csv(LADEC_PATH)
     compounds = []
-
-    # Algorithm: O(N * L) where L is max word length. Very fast.
-    # Iterate through every word in the dictionary.
-    # Check every possible split point.
-    # If left_part is a word AND right_part is a word -> Match.
-    for w in vocab:
-        if len(w) < 10:
-            continue  # User constraint: Total length > 10
-        if not w.isalpha():
-            continue
-
-        # Check all splits
-        # We need subparts to be at least 3 chars
-        # So split index goes from 3 to len(w)-3
-        for i in range(3, len(w) - 3):
-            head = w[:i]
-            tail = w[i:]
-
-            if head in vocab and tail in vocab:
-                # Found a valid compound!
-                compounds.append((w, len(head)))
-                # Break to avoid duplicates (e.g. some words might split multiple ways)
-                break
+    with open(LADEC_PATH, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            c1 = (row.get("c1") or "").strip()
+            stim = (row.get("stim") or "").strip()
+            if not c1 or not stim:
+                continue
+            compounds.append((stim, len(c1)))
+    print(f"[dataset] loaded {len(compounds)} compounds from {LADEC_PATH}", file=sys.stderr)
 
     rows = []
 
