@@ -2,6 +2,8 @@ import argparse
 import json
 import sys
 
+from tabulate import tabulate
+
 END_WORD = "</w>"
 
 
@@ -134,10 +136,7 @@ def main():
         ("becoming", 2),
     ]
 
-    print(
-        f"{'Word':15} | {'BPE Tokens':30} | {'Spectral Tokens':30} | {'BPE_Ok':^6} | {'Spec_Ok':^6}"
-    )
-    print("-" * 100)
+    rows = []
 
     bpe_hits = 0
     spec_hits = 0
@@ -154,16 +153,39 @@ def main():
         if ok_spec:
             spec_hits += 1
 
-        # Only print if they differ (to save space)
+        # Only keep rows if they differ (to save space)
         if ok_bpe != ok_spec:
-            print(
-                f"{word:15} | {str(t_bpe):30} | {str(t_spec):30} | {str(ok_bpe):^6} | {str(ok_spec):^6}"
-            )
+            rows.append([word, str(t_bpe), str(t_spec), ok_bpe, ok_spec])
 
-    print("-" * 100)
-    print(f"Boundary Accuracy (BPE):      {bpe_hits}/{len(compounds)} ({bpe_hits/len(compounds):.2%})")
+    if rows:
+        print(
+            tabulate(
+                rows,
+                headers=["Word", "BPE Tokens", "Spectral Tokens", "BPE_Ok", "Spec_Ok"],
+                tablefmt="github",
+            )
+        )
+    else:
+        print("(No differences found.)")
+
+    print()
     print(
-        f"Boundary Accuracy (Spectral): {spec_hits}/{len(compounds)} ({spec_hits/len(compounds):.2%})"
+        tabulate(
+            [
+                [
+                    "Boundary Accuracy (BPE)",
+                    f"{bpe_hits}/{len(compounds)}",
+                    f"{(bpe_hits/len(compounds)):.2%}",
+                ],
+                [
+                    "Boundary Accuracy (Spectral)",
+                    f"{spec_hits}/{len(compounds)}",
+                    f"{(spec_hits/len(compounds)):.2%}",
+                ],
+            ],
+            headers=["Metric", "Hits", "Rate"],
+            tablefmt="github",
+        )
     )
 
 
