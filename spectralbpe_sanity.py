@@ -12,12 +12,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import re
 import sys
 import time
 from collections import Counter, defaultdict
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Set, Any
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Set, Any
 
 import numpy as np
 
@@ -76,6 +77,36 @@ def strip_end(tokens: Sequence[str]) -> List[str]:
     return out
 
 
+def write_checkpoint(
+    checkpoint_dir: Optional[str],
+    algo: str,
+    merges: List[Tuple[str, str]],
+    step: int,
+    config: Dict[str, Any],
+    seed: Optional[int] = None,
+    tag: Optional[str] = None,
+) -> None:
+    if not checkpoint_dir:
+        return
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    seed_tag = f"_seed{seed}" if seed is not None else ""
+    if tag:
+        fname = f"{algo}{seed_tag}_{tag}.json"
+    else:
+        fname = f"{algo}{seed_tag}_merges_{step:06d}.json"
+    path = os.path.join(checkpoint_dir, fname)
+    payload = {
+        "algo": algo,
+        "seed": seed,
+        "num_merges": len(merges),
+        "merges": [list(p) for p in merges],
+        "config": config,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f"[checkpoint] wrote {path}", file=sys.stderr)
+
+
 # ---------- BPE training ----------
 def init_vocab(word_freq: Counter) -> Dict[Tuple[str, ...], int]:
     vocab = defaultdict(int)
@@ -123,7 +154,13 @@ def apply_merge(vocab: Dict[Tuple[str, ...], int], pair: Tuple[str, str]) -> Dic
     return dict(new)
 
 
-def train_bpe(word_freq: Counter, vocab_size: int, max_merges: Optional[int]) -> List[Tuple[str, str]]:
+def train_bpe(
+    word_freq: Counter,
+    vocab_size: int,
+    max_merges: Optional[int],
+    checkpoint_cb: Optional[Callable[[int, List[Tuple[str, str]]], None]] = None,
+    checkpoint_every: Optional[int] = None,
+) -> List[Tuple[str, str]]:
     vocab = init_vocab(word_freq)
     init_syms = symbol_set(vocab)
     target = vocab_size - len(init_syms)
@@ -138,6 +175,8 @@ def train_bpe(word_freq: Counter, vocab_size: int, max_merges: Optional[int]) ->
         pair, _ = pc.most_common(1)[0]
         vocab = apply_merge(vocab, pair)
         merges.append(pair)
+        if checkpoint_cb is not None and checkpoint_every and len(merges) % checkpoint_every == 0:
+            checkpoint_cb(len(merges), merges)
         if (it + 1) % 200 == 0:
             print(f"[BPE] merges={it+1}/{target}", file=sys.stderr)
     return merges
@@ -323,6 +362,8 @@ def train_spectral_bpe(
     sigma_auto: bool = False,
     deterministic_ties: bool = False,
     bpe_warmstart: int = 0,
+    checkpoint_cb: Optional[Callable[[int, List[Tuple[str, str]]], None]] = None,
+    checkpoint_every: Optional[int] = None,
 ) -> Tuple[List[Tuple[str, str]], Dict[str, Any]]:
     rng = random.Random(seed)
     vocab = init_vocab(word_freq)
@@ -420,6 +461,8 @@ def train_spectral_bpe(
                 break
             vocab = apply_merge(vocab, pair)
             merges.append(pair)
+            if checkpoint_cb is not None and checkpoint_every and len(merges) % checkpoint_every == 0:
+                checkpoint_cb(len(merges), merges)
 
         # Track coherence statistics
         if coherences:
@@ -897,6 +940,10 @@ def main():
     ap.add_argument("--bpe_warmstart", type=int, default=0, help="Number of plain BPE merges before spectral guidance")
     ap.add_argument("--num_seeds", type=int, default=1, help="Run with multiple seeds and report stats")
 
+    # Checkpointing
+    ap.add_argument("--checkpoint_dir", type=str, default=None, help="Directory to write tokenizer merge checkpoints (JSON)")
+    ap.add_argument("--checkpoint_every", type=int, default=0, help="Save a checkpoint every N merges (0 disables)")
+
     # Optional LM generalization test
     ap.add_argument("--train_lm", action="store_true", help="Train a tiny LM and report BPB on eval.txt")
     ap.add_argument("--lm_epochs", type=int, default=2)
@@ -916,8 +963,33 @@ def main():
     if not wf:
         raise RuntimeError("No words found in training data after pretokenization.")
 
+    checkpoint_every = args.checkpoint_every if args.checkpoint_every and args.checkpoint_every > 0 else None
+
+    def make_checkpoint_cb(algo: str, seed: Optional[int] = None, config_override: Optional[Dict[str, Any]] = None):
+        if not args.checkpoint_dir:
+            return None
+        cfg = dict(vars(args))
+        if config_override:
+            cfg.update(config_override)
+        if seed is not None:
+            cfg["seed"] = seed
+
+        def _cb(step: int, merges: List[Tuple[str, str]]):
+            write_checkpoint(args.checkpoint_dir, algo, merges, step, cfg, seed=seed)
+
+        return _cb
+
     print("[train] BPE...", file=sys.stderr)
-    bpe_merges = train_bpe(wf, args.vocab_size, args.max_merges)
+    bpe_cb = make_checkpoint_cb("bpe")
+    bpe_merges = train_bpe(
+        wf,
+        args.vocab_size,
+        args.max_merges,
+        checkpoint_cb=bpe_cb,
+        checkpoint_every=checkpoint_every,
+    )
+    if args.checkpoint_dir:
+        write_checkpoint(args.checkpoint_dir, "bpe", bpe_merges, len(bpe_merges), dict(vars(args)), tag="final")
 
     # Multi-seed evaluation if requested
     if args.num_seeds > 1:
@@ -926,6 +998,7 @@ def main():
         for seed_i in range(args.num_seeds):
             current_seed = args.seed + seed_i
             print(f"[train] SpectralBPE seed {seed_i+1}/{args.num_seeds} (seed={current_seed})...", file=sys.stderr)
+            sp_cb_i = make_checkpoint_cb("spectralbpe", seed=current_seed, config_override={"seed": current_seed})
             sp_merges_i, debug_i = train_spectral_bpe(
                 wf,
                 args.vocab_size,
@@ -941,7 +1014,19 @@ def main():
                 sigma_auto=args.sigma_auto,
                 deterministic_ties=args.deterministic_ties,
                 bpe_warmstart=args.bpe_warmstart,
+                checkpoint_cb=sp_cb_i,
+                checkpoint_every=checkpoint_every,
             )
+            if args.checkpoint_dir:
+                write_checkpoint(
+                    args.checkpoint_dir,
+                    "spectralbpe",
+                    sp_merges_i,
+                    len(sp_merges_i),
+                    dict(vars(args), seed=current_seed),
+                    seed=current_seed,
+                    tag="final",
+                )
             sp_metrics_i, ex_s_i = evaluate(sp_merges_i, eval_lines, args.pretokenize, args.lowercase)
             all_sp_metrics.append(sp_metrics_i)
             if seed_i == 0:
@@ -964,6 +1049,7 @@ def main():
         sp_metrics = all_sp_metrics[0]  # Use first seed for comparison table
     else:
         print("[train] SpectralBPE...", file=sys.stderr)
+        sp_cb = make_checkpoint_cb("spectralbpe", seed=args.seed, config_override={"seed": args.seed})
         sp_merges, debug = train_spectral_bpe(
             wf,
             args.vocab_size,
@@ -979,7 +1065,19 @@ def main():
             sigma_auto=args.sigma_auto,
             deterministic_ties=args.deterministic_ties,
             bpe_warmstart=args.bpe_warmstart,
+            checkpoint_cb=sp_cb,
+            checkpoint_every=checkpoint_every,
         )
+        if args.checkpoint_dir:
+            write_checkpoint(
+                args.checkpoint_dir,
+                "spectralbpe",
+                sp_merges,
+                len(sp_merges),
+                dict(vars(args), seed=args.seed),
+                seed=args.seed,
+                tag="final",
+            )
         sp_metrics, ex_s = evaluate(sp_merges, eval_lines, args.pretokenize, args.lowercase)
 
     bpe_metrics, ex_b = evaluate(bpe_merges, eval_lines, args.pretokenize, args.lowercase)
