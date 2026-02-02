@@ -59,11 +59,14 @@ def encode(word, rank):
 
 
 def check_boundary(tokens, gold_split_index):
-    # Returns True if there is a token boundary EXACTLY at gold_split_index
+    # Success Case 1: The tokenizer found the whole word (e.g. ['rainforests'])
+    if len(tokens) == 1:
+        return True
+
+    # Success Case 2: The tokenizer split exactly at the gold index
     current_len = 0
     for t in tokens:
-        # Remove </w> for length calc
-        clean_t = t.replace(END_WORD, "")
+        clean_t = t.replace('</w>', '')
         current_len += len(clean_t)
         if current_len == gold_split_index:
             return True

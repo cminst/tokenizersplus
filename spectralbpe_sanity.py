@@ -444,7 +444,7 @@ def train_spectral_bpe(
             else:
                 # Fallback Case: No spectral signal (rare or low PPMI)
                 # Fall back to raw frequency (Standard BPE behavior)
-                s = float(n_ab) * 0.1
+                s = float(n_ab) * 1.0
 
             if s > 0 and math.isfinite(s):
                 scored.append((s, (a, b)))
