@@ -387,14 +387,24 @@ def train_spectral_bpe(
 
         scored: List[Tuple[float, Tuple[str, str]]] = []
         coherences = []
+
+        # We need to consider ALL pairs, not just those with high PPMI
         for (a, b), n_ab in N_dir.items():
             w = W_dir.get((a, b), 0.0)
-            if w <= 0.0:
-                continue
-            dz2 = (z.get(a, 0.0) - z.get(b, 0.0)) ** 2
-            coh = math.exp(-dz2 / sigma2) if sigma2 > 0 else 1.0
-            coherences.append(coh)
-            s = float(n_ab) * w * coh
+
+            if w > 0.0:
+                # Spectral Case: Strong signal
+                dz2 = (z.get(a, 0.0) - z.get(b, 0.0)) ** 2
+                coh = math.exp(-dz2 / sigma2) if sigma2 > 0 else 1.0
+                coherences.append(coh)
+
+                # Score = Frequency * PPMI * Coherence
+                s = float(n_ab) * w * coh
+            else:
+                # Fallback Case: No spectral signal (rare or low PPMI)
+                # Fall back to raw frequency (Standard BPE behavior)
+                s = float(n_ab) * 0.1
+
             if s > 0 and math.isfinite(s):
                 scored.append((s, (a, b)))
 
@@ -565,6 +575,35 @@ def top_diff_words(ex_b: Dict[str, List[str]], ex_s: Dict[str, List[str]], k: in
     diffs.sort(key=lambda x: (x[0], x[1]), reverse=True)
     return diffs[:k]
 
+def calc_vocab_quality(merges, init_dir, init_ppmi):
+    """
+    Calculates the average statistical strength (PPMI) of the pairs
+    that were chosen to be merged.
+    """
+    scores = []
+    # We only care about merges that actually existed in the initial graph
+    # (i.e. atomic pairs). Later merges (of longer tokens) are harder to track
+    # back to the initial graph without tracking the full history,
+    # but measuring the "Atomic" merges gives us a good proxy for base cohesiveness.
+
+    # Actually, a better proxy is: Look at every merge (a,b) in the list.
+    # If (a,b) is in our initial bigram table, what is its PPMI?
+    hit = 0
+    miss = 0
+    total_ppmi = 0.0
+
+    for (a, b) in merges:
+        if (a, b) in init_dir:
+            p = init_ppmi.get((a, b), 0.0)
+            scores.append(p)
+            total_ppmi += p
+            hit += 1
+        else:
+            # Pair wasn't in initial character graph (it's a merge of merges)
+            miss += 1
+
+    avg_ppmi = total_ppmi / hit if hit > 0 else 0.0
+    return avg_ppmi, hit, miss
 
 def interpretability(
     bpe_merges: List[Tuple[str, str]],
@@ -647,6 +686,22 @@ def interpretability(
     print("  format: mean_ppmi, mean_coh, median_ppmi, median_coh")
     print(f"  BPE        : {bs}")
     print(f"  SpectralBPE: {ss}")
+
+    init_dir = debug.get("init_dir", Counter())
+    init_ppmi = debug.get("init_ppmi_dir", {})
+
+    print("\n== Vocabulary Quality (Statistical Cohesion) ==")
+    b_score, b_n, _ = calc_vocab_quality(bpe_merges, init_dir, init_ppmi)
+    s_score, s_n, _ = calc_vocab_quality(sp_merges, init_dir, init_ppmi)
+
+    print(f"Metric                       | {'BPE':>10} | {'SpectralBPE':>12}")
+    print("-" * 55)
+    print(f"Avg PPMI of Merges (↑)       | {b_score:10.4f} | {s_score:12.4f}")
+    print(f"(Computed on {min(b_n, s_n)} common atomic pairs)")
+
+    if s_score > b_score:
+        diff = ((s_score - b_score) / b_score) * 100
+        print(f"\n[RESULT] SpectralBPE merges are {diff:.1f}% more statistically cohesive.")
 
 
 # ---------- LM Generalization (optional) ----------
@@ -735,7 +790,7 @@ def train_and_eval_lm(
     train_ids = np.array([stoi.get(t, unk_id) for t in train_tokens], dtype=np.int64)
     eval_ids = np.array([stoi.get(t, unk_id) for t in eval_tokens], dtype=np.int64)
 
-    device = torch.device("cpu")
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     torch.manual_seed(seed)
     random.seed(seed)
 
