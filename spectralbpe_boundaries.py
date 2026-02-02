@@ -1,10 +1,14 @@
 import argparse
 import json
+import os
 import sys
+import urllib.request
 
 from tabulate import tabulate
 
 END_WORD = "</w>"
+DICT_URL = "https://raw.githubusercontent.com/david47k/top-english-wordlists/master/top_english_words_lower_100000.txt"
+DICT_PATH = os.path.join("data", "dictionary.txt")
 
 
 def load_merges(path):
@@ -23,6 +27,29 @@ def load_merges(path):
                 if len(parts) == 2:
                     merges.append((parts[0], parts[1]))
     return merges
+
+
+def ensure_dictionary(path: str) -> None:
+    if os.path.exists(path):
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with urllib.request.urlopen(DICT_URL) as resp:
+        raw = resp.read().decode("utf-8", errors="ignore").splitlines()
+    words = []
+    for w in raw:
+        w = w.strip().lower()
+        if len(w) >= 3:
+            words.append(w)
+    with open(path, "w", encoding="utf-8") as f:
+        for w in words:
+            f.write(w + "\n")
+    print(f"[download] wrote {path} ({len(words)} words)", file=sys.stderr)
+
+
+def load_dictionary(path: str) -> set:
+    ensure_dictionary(path)
+    with open(path, "r", encoding="utf-8") as f:
+        return set(x.strip().lower() for x in f if x.strip())
 
 
 def encode(word, rank):
@@ -85,59 +112,33 @@ def main():
     bpe_rank = {p: i for i, p in enumerate(load_merges(args.bpe))}
     spec_rank = {p: i for i, p in enumerate(load_merges(args.spectral))}
 
-    # A tiny dataset of compound words and their "Golden Split" index
-    # Format: (Word, Index where the split SHOULD be)
-    # e.g. "rainforests": "rain" (4) | "forests"
-    compounds = [
-        ("rainforests", 4),
-        ("waterfall", 5),
-        ("blackboard", 5),
-        ("playground", 4),
-        ("sunflower", 3),
-        ("moonlight", 4),
-        ("cheeseburger", 6),
-        ("firefighter", 4),
-        ("newspapers", 4),
-        ("grandmother", 5),
-        ("underground", 5),
-        ("skyscraper", 3),
-        ("bedroom", 3),
-        ("toothbrush", 5),
-        ("haircut", 4),
-        ("airport", 3),
-        ("notebook", 4),
-        ("superman", 5),
-        ("interchange", 5),
-        ("background", 4),
-        ("subway", 3),
-        ("output", 3),
-        ("wildlife", 4),
-        ("outside", 3),
-        ("inside", 2),
-        ("without", 4),
-        ("within", 4),
-        ("outcome", 3),
-        ("income", 2),
-        ("upstream", 2),
-        ("downstream", 4),
-        ("midstream", 3),
-        ("overcome", 4),
-        ("understand", 5),
-        ("software", 4),
-        ("hardware", 4),
-        ("spacewalk", 5),
-        ("starfish", 4),
-        ("jellyfish", 5),
-        ("lifeguard", 4),
-        ("classmate", 5),
-        ("teammate", 4),
-        ("roommate", 4),
-        ("soulmate", 4),
-        ("become", 2),
-        ("became", 2),
-        ("because", 2),
-        ("becoming", 2),
-    ]
+    vocab = load_dictionary(DICT_PATH)
+    print(f"[dict] loaded {len(vocab)} words from {DICT_PATH}", file=sys.stderr)
+
+    compounds = []
+
+    # Algorithm: O(N * L) where L is max word length. Very fast.
+    # Iterate through every word in the dictionary.
+    # Check every possible split point.
+    # If left_part is a word AND right_part is a word -> Match.
+    for w in vocab:
+        if len(w) < 10:
+            continue  # User constraint: Total length > 10
+        if not w.isalpha():
+            continue
+
+        # Check all splits
+        # We need subparts to be at least 3 chars
+        # So split index goes from 3 to len(w)-3
+        for i in range(3, len(w) - 3):
+            head = w[:i]
+            tail = w[i:]
+
+            if head in vocab and tail in vocab:
+                # Found a valid compound!
+                compounds.append((w, len(head)))
+                # Break to avoid duplicates (e.g. some words might split multiple ways)
+                break
 
     rows = []
 
