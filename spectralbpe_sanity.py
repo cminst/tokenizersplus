@@ -15,6 +15,7 @@ import math
 import os
 import random
 import re
+import shlex
 import sys
 import time
 from collections import Counter, defaultdict
@@ -89,6 +90,7 @@ def write_checkpoint(
     if not checkpoint_dir:
         return
     os.makedirs(checkpoint_dir, exist_ok=True)
+    write_training_command(checkpoint_dir)
     seed_tag = f"_seed{seed}" if seed is not None else ""
     if tag:
         fname = f"{algo}{seed_tag}_{tag}.json"
@@ -105,6 +107,15 @@ def write_checkpoint(
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     print(f"[checkpoint] wrote {path}", file=sys.stderr)
+
+
+def write_training_command(checkpoint_dir: str) -> None:
+    path = os.path.join(checkpoint_dir, "train_command.txt")
+    if os.path.exists(path):
+        return
+    cmd = " ".join(shlex.quote(arg) for arg in sys.argv)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(cmd + "\n")
 
 
 # ---------- BPE training ----------
