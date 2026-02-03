@@ -428,6 +428,7 @@ def train_spectral_bpe(
 
         scored: List[Tuple[float, Tuple[str, str]]] = []
         coherences = []
+        z00_pairs = 0
 
         # We need to consider ALL pairs, not just those with high PPMI
         for (a, b), n_ab in N_dir.items():
@@ -435,7 +436,11 @@ def train_spectral_bpe(
 
             if w > 0.0:
                 # Spectral Case: Strong signal
-                dz2 = (z.get(a, 0.0) - z.get(b, 0.0)) ** 2
+                za = z.get(a, 0.0)
+                zb = z.get(b, 0.0)
+                if za == 0.0 and zb == 0.0:
+                    z00_pairs += 1
+                dz2 = (za - zb) ** 2
                 coh = math.exp(-dz2 / sigma2) if sigma2 > 0 else 1.0
                 coherences.append(coh)
 
@@ -473,12 +478,34 @@ def train_spectral_bpe(
                 "p90": float(np.percentile(coherences, 90)),
             })
 
-        if outer % 10 == 0:
+        if outer == 1 or outer % 10 == 0:
             if coherences:
                 coh_median = np.median(coherences)
                 coh_p10 = np.percentile(coherences, 10)
                 coh_p90 = np.percentile(coherences, 90)
-                print(f"[SpectralBPE] outer={outer} merges={len(merges)}/{target} coherence: median={coh_median:.4f} p10={coh_p10:.4f} p90={coh_p90:.4f}", file=sys.stderr)
+                # Sigma diagnostics:
+                # coh = exp(-dz^2 / sigma^2)  =>  |dz| = sqrt(-log(coh) * sigma^2)
+                coh_arr = np.asarray(coherences, dtype=np.float64)
+                coh_clip = np.clip(coh_arr, 1e-300, 1.0)
+                dz = np.sqrt(-np.log(coh_clip) * sigma2) if sigma2 > 0 else np.zeros_like(coh_clip)
+                dz_p50 = float(np.percentile(dz, 50))
+                dz_p75 = float(np.percentile(dz, 75))
+                dz_p90 = float(np.percentile(dz, 90))
+                p75_over_sigma = (dz_p75 / float(sigma)) if float(sigma) > 0 else float("nan")
+
+                z_exact0 = sum(1 for v in z.values() if v == 0.0)
+                z0_frac = (z_exact0 / len(z)) if z else 0.0
+                z00_frac = (z00_pairs / len(coherences)) if coherences else 0.0
+
+                print(
+                    f"[SpectralBPE] outer={outer} merges={len(merges)}/{target} "
+                    f"sigma={float(sigma):.4g} "
+                    f"coh: med={coh_median:.4f} p10={coh_p10:.4f} p90={coh_p90:.4f} "
+                    f"|dz|: p50={dz_p50:.4g} p75={dz_p75:.4g} p90={dz_p90:.4g} "
+                    f"(p75/sigma={p75_over_sigma:.3f}) "
+                    f"z0_frac={z0_frac:.3f} z00_pairs_frac={z00_frac:.3f}",
+                    file=sys.stderr,
+                )
             else:
                 print(f"[SpectralBPE] outer={outer} merges={len(merges)}/{target}", file=sys.stderr)
 
