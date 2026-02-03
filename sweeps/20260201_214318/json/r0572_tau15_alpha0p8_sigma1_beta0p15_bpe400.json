@@ -1,0 +1,63 @@
+{
+  "config": {
+    "train_text": "data/train.txt",
+    "eval_text": "data/eval.txt",
+    "vocab_size": 8000,
+    "pretokenize": "whitespace",
+    "lowercase": false,
+    "max_train_lines": null,
+    "max_eval_lines": null,
+    "max_merges": null,
+    "tau": 15,
+    "alpha": 0.8,
+    "sigma": 1.0,
+    "batch_size": 100,
+    "eig_k": 8,
+    "eig_eps": 1e-08,
+    "seed": 0,
+    "beta": 0.15,
+    "sigma_auto": false,
+    "deterministic_ties": false,
+    "bpe_warmstart": 400,
+    "num_seeds": 1,
+    "checkpoint_dir": null,
+    "checkpoint_every": 0,
+    "train_lm": false,
+    "lm_epochs": 2,
+    "lm_batch_size": 16,
+    "lm_block_size": 128,
+    "lm_dim": 128,
+    "lm_heads": 4,
+    "lm_layers": 2,
+    "lm_lr": 0.0003,
+    "out_json": "sweeps/20260201_214318/json/r0572_tau15_alpha0p8_sigma1_beta0p15_bpe400.json"
+  },
+  "metrics": {
+    "bpe": {
+      "bytes": 1141787.0,
+      "words": 213886.0,
+      "tokens": 414290.0,
+      "bytes_per_token": 2.7560090757681817,
+      "tokens_per_byte": 0.362843507589419,
+      "fertility": 1.9369664213646522,
+      "pcw": 0.45533602012286917,
+      "avg_token_chars": 2.228723840787854,
+      "unique_tokens_used": 1183.0
+    },
+    "spectralbpe": {
+      "bytes": 1141787.0,
+      "words": 213886.0,
+      "tokens": 424359.0,
+      "bytes_per_token": 2.690615728663702,
+      "tokens_per_byte": 0.3716621401364703,
+      "fertility": 1.9840429013586678,
+      "pcw": 0.4393321676033027,
+      "avg_token_chars": 2.1758416812180252,
+      "unique_tokens_used": 1189.0
+    }
+  },
+  "num_merges": {
+    "bpe": 1013,
+    "spectralbpe": 1013
+  }
+}

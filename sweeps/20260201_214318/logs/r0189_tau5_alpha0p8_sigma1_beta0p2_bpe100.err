@@ -1,0 +1,11 @@
+[train] BPE...
+[BPE] merges=200/1013
+[BPE] merges=400/1013
+[BPE] merges=600/1013
+[BPE] merges=800/1013
+[BPE] merges=1000/1013
+[train] SpectralBPE...
+[SpectralBPE] warm-start: running 100 BPE merges first
+[SpectralBPE] warm-start complete: 100 merges done
+[SpectralBPE] outer=10 merges=1013/1013 coherence: median=1.0000 p10=1.0000 p90=1.0000
+[out] wrote sweeps/20260201_214318/json/r0189_tau5_alpha0p8_sigma1_beta0p2_bpe100.json

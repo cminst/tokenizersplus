@@ -1,0 +1,10 @@
+[train] BPE...
+[BPE] merges=200/1013
+[BPE] merges=400/1013
+[BPE] merges=600/1013
+[BPE] merges=800/1013
+[BPE] merges=1000/1013
+[train] SpectralBPE...
+[SpectralBPE] warm-start: running 300 BPE merges first
+[SpectralBPE] warm-start complete: 300 merges done
+[out] wrote sweeps/20260201_214318/json/r0483_tau15_alpha0p6_sigma0p8_beta0p01_bpe300.json
