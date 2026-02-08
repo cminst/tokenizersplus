@@ -5,6 +5,7 @@
 #
 # Requirements:
 #   pip install numpy scipy
+#   pip install sentencepiece  # only needed for --methods unigram
 #   pip install torch  # only needed for --train_lm
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import random
 import re
 import shlex
 import sys
+import tempfile
 import time
 from collections import Counter, defaultdict
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Set, Any
@@ -30,6 +32,32 @@ except Exception as e:
     raise RuntimeError("This script needs scipy (scipy.sparse + eigsh). Install: pip install scipy") from e
 
 END_WORD = "</w>"
+ALLOWED_METHODS = ("bpe", "spectralbpe", "unigram")
+METHOD_LABELS = {
+    "bpe": "BPE",
+    "spectralbpe": "SpectralBPE",
+    "unigram": "Unigram",
+}
+
+
+def parse_methods(methods_arg: Optional[str]) -> List[str]:
+    if not methods_arg:
+        return list(ALLOWED_METHODS)
+    parts = [p.strip().lower() for p in methods_arg.split(",")]
+    parts = [p for p in parts if p]
+    if not parts:
+        return list(ALLOWED_METHODS)
+    unknown = [p for p in parts if p not in ALLOWED_METHODS]
+    if unknown:
+        raise ValueError(f"Unknown --methods entries: {', '.join(unknown)}")
+    seen = set()
+    out = []
+    for p in parts:
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
 
 
 # ---------- I/O ----------
@@ -191,6 +219,123 @@ def train_bpe(
         if (it + 1) % 200 == 0:
             print(f"[BPE] merges={it+1}/{target}", file=sys.stderr)
     return merges
+
+
+# ---------- Unigram (SentencePiece) ----------
+def _normalize_line_for_spm(line: str, pre_mode: str, lowercase: bool) -> str:
+    if lowercase:
+        line = line.lower()
+    toks = pretokenize(line, pre_mode)
+    return " ".join(toks)
+
+
+def _write_spm_input(lines: Sequence[str], pre_mode: str, lowercase: bool, path: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for line in lines:
+            norm = _normalize_line_for_spm(line, pre_mode, lowercase)
+            if norm:
+                f.write(norm + "\n")
+
+
+def train_sentencepiece_unigram(
+    train_lines: Sequence[str],
+    pre_mode: str,
+    lowercase: bool,
+    vocab_size: int,
+    model_prefix: Optional[str] = None,
+) -> Tuple[Any, str, Optional[tempfile.TemporaryDirectory]]:
+    try:
+        import sentencepiece as spm
+    except Exception as e:
+        raise RuntimeError(
+            "SentencePiece is required for the unigram baseline. Install: pip install sentencepiece"
+        ) from e
+
+    if model_prefix is not None:
+        model_file = model_prefix + ".model"
+        if os.path.exists(model_file):
+            sp = spm.SentencePieceProcessor(model_file=model_file)
+            return sp, model_prefix, None
+
+    tmpdir = None
+    if model_prefix is None:
+        tmpdir = tempfile.TemporaryDirectory()
+        model_prefix = os.path.join(tmpdir.name, "unigram")
+
+    input_path = model_prefix + ".train.txt"
+    _write_spm_input(train_lines, pre_mode, lowercase, input_path)
+
+    spm.SentencePieceTrainer.train(
+        input=input_path,
+        model_prefix=model_prefix,
+        vocab_size=vocab_size,
+        model_type="unigram",
+        character_coverage=1.0,
+        hard_vocab_limit=False,
+    )
+    sp = spm.SentencePieceProcessor(model_file=model_prefix + ".model")
+    return sp, model_prefix, tmpdir
+
+
+def encode_word_sp(sp, word: str) -> List[str]:
+    if not word:
+        return []
+    if hasattr(sp, "encode"):
+        return sp.encode(word, out_type=str)
+    return sp.EncodeAsPieces(word)
+
+
+def evaluate_unigram(
+    sp,
+    eval_lines: Iterable[str],
+    pre_mode: str,
+    lowercase: bool,
+    max_examples: int = 20000,
+) -> Tuple[Dict[str, float], Dict[str, List[str]]]:
+    total_bytes = 0
+    total_words = 0
+    total_tokens = 0
+    continued = 0
+    uniq: Set[str] = set()
+    tok_char_sum = 0
+    examples: Dict[str, List[str]] = {}
+
+    for line in eval_lines:
+        if lowercase:
+            line = line.lower()
+        total_bytes += len(line.encode("utf-8", errors="ignore"))
+        for w in pretokenize(line, pre_mode):
+            if not w:
+                continue
+            t = encode_word_sp(sp, w)
+            total_words += 1
+            total_tokens += len(t)
+            if len(t) >= 2:
+                continued += 1
+            for x in t:
+                uniq.add(x)
+                tok_char_sum += len(x)
+            if len(examples) < max_examples and w not in examples:
+                examples[w] = t
+
+    fert = total_tokens / total_words if total_words else 0.0
+    pcw = continued / total_words if total_words else 0.0
+    bpt = total_bytes / total_tokens if total_tokens else 0.0
+    tpb = total_tokens / total_bytes if total_bytes else 0.0
+    atl = tok_char_sum / total_tokens if total_tokens else 0.0
+
+    metrics = {
+        "bytes": float(total_bytes),
+        "words": float(total_words),
+        "tokens": float(total_tokens),
+        "bytes_per_token": float(bpt),
+        "tokens_per_byte": float(tpb),
+        "fertility": float(fert),
+        "pcw": float(pcw),
+        "avg_token_chars": float(atl),
+        "unique_tokens_used": float(len(uniq)),
+    }
+    return metrics, examples
 
 
 # ---------- SpectralBPE training ----------
@@ -621,14 +766,20 @@ def evaluate(
     return metrics, examples
 
 
-def print_table(bpe: Dict[str, float], sp: Dict[str, float]) -> None:
-    nsl = (sp["tokens"] / bpe["tokens"]) if bpe["tokens"] else float("nan")
+def print_table(metrics_by_method: Dict[str, Dict[str, float]]) -> None:
+    methods = [m for m in ALLOWED_METHODS if m in metrics_by_method]
+    if not methods:
+        print("\n== Intrinsic sanity-check metrics ==\n(no methods selected)")
+        return
+
     print("\n== Intrinsic sanity-check metrics ==")
-    print(f"{'Metric':38s} | {'BPE':>12s} | {'SpectralBPE':>12s}")
-    print("-" * 70)
+    header = f"{'Metric':38s} | " + " | ".join(f"{METHOD_LABELS[m]:>12s}" for m in methods)
+    print(header)
+    print("-" * max(70, len(header)))
 
     def row(name, key, fmt="{:.6f}"):
-        print(f"{name:38s} | {fmt.format(bpe[key]):>12s} | {fmt.format(sp[key]):>12s}")
+        vals = [fmt.format(metrics_by_method[m][key]) for m in methods]
+        print(f"{name:38s} | " + " | ".join(f"{v:>12s}" for v in vals))
 
     row("Bytes per token (↑)", "bytes_per_token")
     row("Tokens per byte (↓)", "tokens_per_byte")
@@ -636,12 +787,24 @@ def print_table(bpe: Dict[str, float], sp: Dict[str, float]) -> None:
     row("PCW = P(word split) (↓)", "pcw")
     row("Avg token length (chars) (↑)", "avg_token_chars")
     row("Unique tokens used on eval", "unique_tokens_used", fmt="{:.0f}")
-    print(f"{'NSL vs BPE (tokens_sp/tokens_bpe) (↓)':38s} | {1.0:12.6f} | {nsl:12.6f}")
-    print("-" * 70)
-    print(
-        f"Totals: bytes={int(bpe['bytes'])} words={int(bpe['words'])} "
-        f"BPE_tokens={int(bpe['tokens'])} Spectral_tokens={int(sp['tokens'])}"
+
+    if "bpe" in metrics_by_method and len(methods) > 1:
+        bpe_tokens = metrics_by_method["bpe"]["tokens"]
+        nsl_vals = []
+        for m in methods:
+            if m == "bpe":
+                nsl_vals.append(1.0)
+            else:
+                nsl_vals.append((metrics_by_method[m]["tokens"] / bpe_tokens) if bpe_tokens else float("nan"))
+        nsl_row = " | ".join(f"{v:12.6f}" for v in nsl_vals)
+        print(f"{'NSL vs BPE (tokens_m/tokens_bpe) (↓)':38s} | {nsl_row}")
+
+    print("-" * max(70, len(header)))
+    base = metrics_by_method[methods[0]]
+    tokens_str = " ".join(
+        f"{METHOD_LABELS[m]}_tokens={int(metrics_by_method[m]['tokens'])}" for m in methods
     )
+    print(f"Totals: bytes={int(base['bytes'])} words={int(base['words'])} {tokens_str}")
 
 
 # ---------- Interpretability ----------
@@ -809,6 +972,28 @@ def tokens_from_lines(
     return tokens, lengths
 
 
+def tokens_from_lines_sp(
+    lines: Sequence[str],
+    sp,
+    pre_mode: str,
+    lowercase: bool,
+) -> Tuple[List[str], List[int]]:
+    tokens: List[str] = []
+    lengths: List[int] = []
+    for line in lines:
+        if lowercase:
+            line = line.lower()
+        line_tokens: List[str] = []
+        for w in pretokenize(line, pre_mode):
+            if not w:
+                continue
+            line_tokens.extend(encode_word_sp(sp, w))
+        if line_tokens:
+            lengths.append(len(line_tokens))
+            tokens.extend(line_tokens)
+    return tokens, lengths
+
+
 def build_vocab(tokens: Sequence[str]) -> Tuple[List[str], Dict[str, int]]:
     uniq = [t for t in sorted(set(tokens)) if t != "<unk>"]
     vocab = ["<unk>"] + uniq
@@ -852,6 +1037,72 @@ def train_and_eval_lm(
     lr: float,
     seed: int,
 ) -> Tuple[float, float, float]:
+    train_tokens, _ = tokens_from_lines(train_lines, merges, pre_mode, lowercase)
+    eval_tokens, eval_lengths = tokens_from_lines(eval_lines, merges, pre_mode, lowercase)
+    return train_and_eval_lm_from_tokens(
+        train_tokens=train_tokens,
+        eval_tokens=eval_tokens,
+        eval_lengths=eval_lengths,
+        eval_bytes=eval_bytes,
+        epochs=epochs,
+        batch_size=batch_size,
+        block_size=block_size,
+        n_embd=n_embd,
+        n_head=n_head,
+        n_layer=n_layer,
+        lr=lr,
+        seed=seed,
+    )
+
+
+def train_and_eval_lm_sp(
+    train_lines: Sequence[str],
+    eval_lines: Sequence[str],
+    sp,
+    pre_mode: str,
+    lowercase: bool,
+    eval_bytes: int,
+    epochs: int,
+    batch_size: int,
+    block_size: int,
+    n_embd: int,
+    n_head: int,
+    n_layer: int,
+    lr: float,
+    seed: int,
+) -> Tuple[float, float, float]:
+    train_tokens, _ = tokens_from_lines_sp(train_lines, sp, pre_mode, lowercase)
+    eval_tokens, eval_lengths = tokens_from_lines_sp(eval_lines, sp, pre_mode, lowercase)
+    return train_and_eval_lm_from_tokens(
+        train_tokens=train_tokens,
+        eval_tokens=eval_tokens,
+        eval_lengths=eval_lengths,
+        eval_bytes=eval_bytes,
+        epochs=epochs,
+        batch_size=batch_size,
+        block_size=block_size,
+        n_embd=n_embd,
+        n_head=n_head,
+        n_layer=n_layer,
+        lr=lr,
+        seed=seed,
+    )
+
+
+def train_and_eval_lm_from_tokens(
+    train_tokens: Sequence[str],
+    eval_tokens: Sequence[str],
+    eval_lengths: Sequence[int],
+    eval_bytes: int,
+    epochs: int,
+    batch_size: int,
+    block_size: int,
+    n_embd: int,
+    n_head: int,
+    n_layer: int,
+    lr: float,
+    seed: int,
+) -> Tuple[float, float, float]:
     try:
         import torch
         import torch.nn as nn
@@ -859,8 +1110,6 @@ def train_and_eval_lm(
     except Exception as e:
         raise RuntimeError("Torch is required for --train_lm. Install: pip install torch") from e
 
-    train_tokens, _ = tokens_from_lines(train_lines, merges, pre_mode, lowercase)
-    eval_tokens, eval_lengths = tokens_from_lines(eval_lines, merges, pre_mode, lowercase)
     avg_seq_len = (sum(eval_lengths) / len(eval_lengths)) if eval_lengths else 0.0
 
     if len(train_tokens) < block_size + 1:
@@ -939,15 +1188,24 @@ def train_and_eval_lm(
     return bpb, avg_seq_len, train_time
 
 
-def print_lm_table(bpe_res: Tuple[float, float, float], sp_res: Tuple[float, float, float]) -> None:
-    b_bpb, b_seq, b_time = bpe_res
-    s_bpb, s_seq, s_time = sp_res
+def print_lm_table(lm_by_method: Dict[str, Tuple[float, float, float]]) -> None:
+    methods = [m for m in ALLOWED_METHODS if m in lm_by_method]
+    if not methods:
+        print("\n== LM generalization (BPB) ==\n(no methods selected)")
+        return
+
     print("\n== LM generalization (BPB) ==")
-    print(f"{'Metric':24s} | {'BPE':>12s} | {'SpectralBPE':>12s}")
-    print("-" * 56)
-    print(f"{'BPB (eval)':24s} | {b_bpb:12.6f} | {s_bpb:12.6f}")
-    print(f"{'Avg tokens/sent':24s} | {b_seq:12.2f} | {s_seq:12.2f}")
-    print(f"{'Training time (s)':24s} | {b_time:12.2f} | {s_time:12.2f}")
+    header = f"{'Metric':24s} | " + " | ".join(f"{METHOD_LABELS[m]:>12s}" for m in methods)
+    print(header)
+    print("-" * max(56, len(header)))
+
+    def row(name: str, idx: int, fmt: str):
+        vals = [fmt.format(lm_by_method[m][idx]) for m in methods]
+        print(f"{name:24s} | " + " | ".join(f"{v:>12s}" for v in vals))
+
+    row("BPB (eval)", 0, "{:.6f}")
+    row("Avg tokens/sent", 1, "{:.2f}")
+    row("Training time (s)", 2, "{:.2f}")
 
 
 # ---------- Main ----------
@@ -961,6 +1219,18 @@ def main():
     ap.add_argument("--max_train_lines", type=int, default=None)
     ap.add_argument("--max_eval_lines", type=int, default=None)
     ap.add_argument("--max_merges", type=int, default=None)
+    ap.add_argument(
+        "--methods",
+        type=str,
+        default=None,
+        help="Comma-separated list of methods to run: bpe,spectralbpe,unigram (default: all)",
+    )
+    ap.add_argument(
+        "--unigram_model_prefix",
+        type=str,
+        default=None,
+        help="Prefix for SentencePiece Unigram model files (default: checkpoint_dir/unigram or temp)",
+    )
 
     # SpectralBPE params
     ap.add_argument("--tau", type=int, default=2, help="Minimum pair count threshold (default: 2, was 5)")
@@ -995,11 +1265,28 @@ def main():
     ap.add_argument("--out_json", type=str, default=None)
     args = ap.parse_args()
 
+    try:
+        methods = parse_methods(args.methods)
+    except ValueError as e:
+        ap.error(str(e))
+    if not methods:
+        ap.error("No methods selected.")
+    do_bpe = "bpe" in methods
+    do_sp = "spectralbpe" in methods
+    do_uni = "unigram" in methods
+
     train_lines = list(iter_lines(args.train_text, args.max_train_lines))
     eval_lines = list(iter_lines(args.eval_text, args.max_eval_lines))
-    wf = build_word_freq(train_lines, args.pretokenize, args.lowercase)
-    if not wf:
-        raise RuntimeError("No words found in training data after pretokenization.")
+    if not train_lines:
+        raise RuntimeError("No training lines found.")
+    if not eval_lines:
+        raise RuntimeError("No evaluation lines found.")
+
+    wf = None
+    if do_bpe or do_sp:
+        wf = build_word_freq(train_lines, args.pretokenize, args.lowercase)
+        if not wf:
+            raise RuntimeError("No words found in training data after pretokenization.")
 
     checkpoint_every = args.checkpoint_every if args.checkpoint_every and args.checkpoint_every > 0 else None
 
@@ -1017,27 +1304,92 @@ def main():
 
         return _cb
 
-    print("[train] BPE...", file=sys.stderr)
-    bpe_cb = make_checkpoint_cb("bpe")
-    bpe_merges = train_bpe(
-        wf,
-        args.vocab_size,
-        args.max_merges,
-        checkpoint_cb=bpe_cb,
-        checkpoint_every=checkpoint_every,
-    )
-    if args.checkpoint_dir:
-        write_checkpoint(args.checkpoint_dir, "bpe", bpe_merges, len(bpe_merges), dict(vars(args)), tag="final")
+    bpe_merges = None
+    sp_merges = None
+    debug: Dict[str, Any] = {}
+    ex_b: Dict[str, List[str]] = {}
+    ex_s: Dict[str, List[str]] = {}
+    bpe_metrics = None
+    sp_metrics = None
+    uni_metrics = None
+    sp_model = None
+    unigram_tmpdir = None
+    unigram_model_prefix = args.unigram_model_prefix
 
-    # Multi-seed evaluation if requested
-    if args.num_seeds > 1:
-        print(f"[train] SpectralBPE with {args.num_seeds} seeds...", file=sys.stderr)
-        all_sp_metrics = []
-        for seed_i in range(args.num_seeds):
-            current_seed = args.seed + seed_i
-            print(f"[train] SpectralBPE seed {seed_i+1}/{args.num_seeds} (seed={current_seed})...", file=sys.stderr)
-            sp_cb_i = make_checkpoint_cb("spectralbpe", seed=current_seed, config_override={"seed": current_seed})
-            sp_merges_i, debug_i = train_spectral_bpe(
+    if do_bpe:
+        print("[train] BPE...", file=sys.stderr)
+        bpe_cb = make_checkpoint_cb("bpe")
+        bpe_merges = train_bpe(
+            wf,
+            args.vocab_size,
+            args.max_merges,
+            checkpoint_cb=bpe_cb,
+            checkpoint_every=checkpoint_every,
+        )
+        if args.checkpoint_dir:
+            write_checkpoint(args.checkpoint_dir, "bpe", bpe_merges, len(bpe_merges), dict(vars(args)), tag="final")
+
+    if do_sp:
+        # Multi-seed evaluation if requested
+        if args.num_seeds > 1:
+            print(f"[train] SpectralBPE with {args.num_seeds} seeds...", file=sys.stderr)
+            all_sp_metrics = []
+            for seed_i in range(args.num_seeds):
+                current_seed = args.seed + seed_i
+                print(f"[train] SpectralBPE seed {seed_i+1}/{args.num_seeds} (seed={current_seed})...", file=sys.stderr)
+                sp_cb_i = make_checkpoint_cb("spectralbpe", seed=current_seed, config_override={"seed": current_seed})
+                sp_merges_i, debug_i = train_spectral_bpe(
+                    wf,
+                    args.vocab_size,
+                    tau=args.tau,
+                    alpha=args.alpha,
+                    sigma=args.sigma,
+                    batch_size=args.batch_size,
+                    eig_k=args.eig_k,
+                    eig_eps=args.eig_eps,
+                    seed=current_seed,
+                    max_merges=args.max_merges,
+                    beta=args.beta,
+                    sigma_auto=args.sigma_auto,
+                    deterministic_ties=args.deterministic_ties,
+                    bpe_warmstart=args.bpe_warmstart,
+                    checkpoint_cb=sp_cb_i,
+                    checkpoint_every=checkpoint_every,
+                )
+                if args.checkpoint_dir:
+                    write_checkpoint(
+                        args.checkpoint_dir,
+                        "spectralbpe",
+                        sp_merges_i,
+                        len(sp_merges_i),
+                        dict(vars(args), seed=current_seed),
+                        seed=current_seed,
+                        tag="final",
+                    )
+                sp_metrics_i, ex_s_i = evaluate(sp_merges_i, eval_lines, args.pretokenize, args.lowercase)
+                all_sp_metrics.append(sp_metrics_i)
+                if seed_i == 0:
+                    sp_merges, debug, ex_s = sp_merges_i, debug_i, ex_s_i
+
+            # Compute mean and std across seeds
+            keys = ["bytes_per_token", "tokens_per_byte", "fertility", "pcw", "avg_token_chars"]
+            sp_metrics_mean = {}
+            sp_metrics_std = {}
+            for key in keys:
+                values = [m[key] for m in all_sp_metrics]
+                sp_metrics_mean[key] = float(np.mean(values))
+                sp_metrics_std[key] = float(np.std(values))
+
+            print("\n=== Multi-seed Results ===", file=sys.stderr)
+            print(f"Seeds: {args.num_seeds}", file=sys.stderr)
+            for key in keys:
+                print(f"  {key}: {sp_metrics_mean[key]:.6f} ± {sp_metrics_std[key]:.6f}", file=sys.stderr)
+
+            sp_metrics = all_sp_metrics[0]  # Use first seed for comparison table
+        else:
+            print("[train] SpectralBPE...", file=sys.stderr)
+            sp_cb = make_checkpoint_cb("spectralbpe", seed=args.seed, config_override={"seed": args.seed})
+            sp_merges, debug = train_spectral_bpe(
                 wf,
                 args.vocab_size,
                 tau=args.tau,
@@ -1046,84 +1398,58 @@ def main():
                 batch_size=args.batch_size,
                 eig_k=args.eig_k,
                 eig_eps=args.eig_eps,
-                seed=current_seed,
+                seed=args.seed,
                 max_merges=args.max_merges,
                 beta=args.beta,
                 sigma_auto=args.sigma_auto,
                 deterministic_ties=args.deterministic_ties,
                 bpe_warmstart=args.bpe_warmstart,
-                checkpoint_cb=sp_cb_i,
+                checkpoint_cb=sp_cb,
                 checkpoint_every=checkpoint_every,
             )
             if args.checkpoint_dir:
                 write_checkpoint(
                     args.checkpoint_dir,
                     "spectralbpe",
-                    sp_merges_i,
-                    len(sp_merges_i),
-                    dict(vars(args), seed=current_seed),
-                    seed=current_seed,
+                    sp_merges,
+                    len(sp_merges),
+                    dict(vars(args), seed=args.seed),
+                    seed=args.seed,
                     tag="final",
                 )
-            sp_metrics_i, ex_s_i = evaluate(sp_merges_i, eval_lines, args.pretokenize, args.lowercase)
-            all_sp_metrics.append(sp_metrics_i)
-            if seed_i == 0:
-                sp_merges, debug, ex_s = sp_merges_i, debug_i, ex_s_i
+            sp_metrics, ex_s = evaluate(sp_merges, eval_lines, args.pretokenize, args.lowercase)
 
-        # Compute mean and std across seeds
-        keys = ["nsl", "bytes_per_token", "tokens_per_byte", "fertility", "pcw"]
-        sp_metrics_mean = {}
-        sp_metrics_std = {}
-        for key in keys:
-            values = [m[key] for m in all_sp_metrics]
-            sp_metrics_mean[key] = float(np.mean(values))
-            sp_metrics_std[key] = float(np.std(values))
+    if do_bpe and bpe_merges is not None:
+        bpe_metrics, ex_b = evaluate(bpe_merges, eval_lines, args.pretokenize, args.lowercase)
 
-        print("\n=== Multi-seed Results ===", file=sys.stderr)
-        print(f"Seeds: {args.num_seeds}", file=sys.stderr)
-        for key in keys:
-            print(f"  {key}: {sp_metrics_mean[key]:.6f} ± {sp_metrics_std[key]:.6f}", file=sys.stderr)
-
-        sp_metrics = all_sp_metrics[0]  # Use first seed for comparison table
-    else:
-        print("[train] SpectralBPE...", file=sys.stderr)
-        sp_cb = make_checkpoint_cb("spectralbpe", seed=args.seed, config_override={"seed": args.seed})
-        sp_merges, debug = train_spectral_bpe(
-            wf,
+    if do_uni:
+        if unigram_model_prefix is None and args.checkpoint_dir:
+            unigram_model_prefix = os.path.join(args.checkpoint_dir, "unigram")
+        print("[train] Unigram (SentencePiece)...", file=sys.stderr)
+        sp_model, unigram_model_prefix, unigram_tmpdir = train_sentencepiece_unigram(
+            train_lines,
+            args.pretokenize,
+            args.lowercase,
             args.vocab_size,
-            tau=args.tau,
-            alpha=args.alpha,
-            sigma=args.sigma,
-            batch_size=args.batch_size,
-            eig_k=args.eig_k,
-            eig_eps=args.eig_eps,
-            seed=args.seed,
-            max_merges=args.max_merges,
-            beta=args.beta,
-            sigma_auto=args.sigma_auto,
-            deterministic_ties=args.deterministic_ties,
-            bpe_warmstart=args.bpe_warmstart,
-            checkpoint_cb=sp_cb,
-            checkpoint_every=checkpoint_every,
+            model_prefix=unigram_model_prefix,
         )
-        if args.checkpoint_dir:
-            write_checkpoint(
-                args.checkpoint_dir,
-                "spectralbpe",
-                sp_merges,
-                len(sp_merges),
-                dict(vars(args), seed=args.seed),
-                seed=args.seed,
-                tag="final",
-            )
-        sp_metrics, ex_s = evaluate(sp_merges, eval_lines, args.pretokenize, args.lowercase)
+        uni_metrics, _ = evaluate_unigram(sp_model, eval_lines, args.pretokenize, args.lowercase)
 
-    bpe_metrics, ex_b = evaluate(bpe_merges, eval_lines, args.pretokenize, args.lowercase)
+    metrics_by_method: Dict[str, Dict[str, float]] = {}
+    if bpe_metrics is not None:
+        metrics_by_method["bpe"] = bpe_metrics
+    if sp_metrics is not None:
+        metrics_by_method["spectralbpe"] = sp_metrics
+    if uni_metrics is not None:
+        metrics_by_method["unigram"] = uni_metrics
 
-    print_table(bpe_metrics, sp_metrics)
-    interpretability(bpe_merges, sp_merges, ex_b, ex_s, debug, sigma=args.sigma if not args.sigma_auto else debug.get("auto_sigma", args.sigma))
+    print_table(metrics_by_method)
+    if do_bpe and do_sp and bpe_merges is not None and sp_merges is not None:
+        sigma_val = args.sigma if not args.sigma_auto else debug.get("auto_sigma", args.sigma)
+        interpretability(bpe_merges, sp_merges, ex_b, ex_s, debug, sigma=sigma_val)
 
-    lm_results = None
+    lm_results: Dict[str, Tuple[float, float, float]] = {}
+    lm_eval_bytes = None
     if args.train_lm:
         if args.max_eval_lines is None:
             try:
@@ -1132,62 +1458,112 @@ def main():
                 eval_bytes = sum(len((line + "\n").encode("utf-8", errors="ignore")) for line in eval_lines)
         else:
             eval_bytes = sum(len((line + "\n").encode("utf-8", errors="ignore")) for line in eval_lines)
+        lm_eval_bytes = eval_bytes
 
-        print("\n[train] LM on BPE tokens...", file=sys.stderr)
-        bpe_lm = train_and_eval_lm(
-            train_lines,
-            eval_lines,
-            bpe_merges,
-            args.pretokenize,
-            args.lowercase,
-            eval_bytes=eval_bytes,
-            epochs=args.lm_epochs,
-            batch_size=args.lm_batch_size,
-            block_size=args.lm_block_size,
-            n_embd=args.lm_dim,
-            n_head=args.lm_heads,
-            n_layer=args.lm_layers,
-            lr=args.lm_lr,
-            seed=args.seed,
-        )
+        if do_bpe and bpe_merges is not None:
+            print("\n[train] LM on BPE tokens...", file=sys.stderr)
+            bpe_lm = train_and_eval_lm(
+                train_lines,
+                eval_lines,
+                bpe_merges,
+                args.pretokenize,
+                args.lowercase,
+                eval_bytes=eval_bytes,
+                epochs=args.lm_epochs,
+                batch_size=args.lm_batch_size,
+                block_size=args.lm_block_size,
+                n_embd=args.lm_dim,
+                n_head=args.lm_heads,
+                n_layer=args.lm_layers,
+                lr=args.lm_lr,
+                seed=args.seed,
+            )
+            lm_results["bpe"] = bpe_lm
 
-        print("[train] LM on SpectralBPE tokens...", file=sys.stderr)
-        sp_lm = train_and_eval_lm(
-            train_lines,
-            eval_lines,
-            sp_merges,
-            args.pretokenize,
-            args.lowercase,
-            eval_bytes=eval_bytes,
-            epochs=args.lm_epochs,
-            batch_size=args.lm_batch_size,
-            block_size=args.lm_block_size,
-            n_embd=args.lm_dim,
-            n_head=args.lm_heads,
-            n_layer=args.lm_layers,
-            lr=args.lm_lr,
-            seed=args.seed,
-        )
+        if do_sp and sp_merges is not None:
+            print("[train] LM on SpectralBPE tokens...", file=sys.stderr)
+            sp_lm = train_and_eval_lm(
+                train_lines,
+                eval_lines,
+                sp_merges,
+                args.pretokenize,
+                args.lowercase,
+                eval_bytes=eval_bytes,
+                epochs=args.lm_epochs,
+                batch_size=args.lm_batch_size,
+                block_size=args.lm_block_size,
+                n_embd=args.lm_dim,
+                n_head=args.lm_heads,
+                n_layer=args.lm_layers,
+                lr=args.lm_lr,
+                seed=args.seed,
+            )
+            lm_results["spectralbpe"] = sp_lm
 
-        print_lm_table(bpe_lm, sp_lm)
-        lm_results = {"bpe": bpe_lm, "spectralbpe": sp_lm, "eval_bytes": eval_bytes}
+        if do_uni and sp_model is not None:
+            print("[train] LM on Unigram tokens...", file=sys.stderr)
+            uni_lm = train_and_eval_lm_sp(
+                train_lines,
+                eval_lines,
+                sp_model,
+                args.pretokenize,
+                args.lowercase,
+                eval_bytes=eval_bytes,
+                epochs=args.lm_epochs,
+                batch_size=args.lm_batch_size,
+                block_size=args.lm_block_size,
+                n_embd=args.lm_dim,
+                n_head=args.lm_heads,
+                n_layer=args.lm_layers,
+                lr=args.lm_lr,
+                seed=args.seed,
+            )
+            lm_results["unigram"] = uni_lm
+
+        if lm_results:
+            print_lm_table(lm_results)
 
     if args.out_json:
         payload = {
             "config": vars(args),
-            "metrics": {"bpe": bpe_metrics, "spectralbpe": sp_metrics},
-            "num_merges": {"bpe": len(bpe_merges), "spectralbpe": len(sp_merges)},
+            "metrics": metrics_by_method,
         }
-        if lm_results is not None:
-            payload["lm"] = {
-                "bpe_bpb": lm_results["bpe"][0],
-                "bpe_avg_seq_len": lm_results["bpe"][1],
-                "bpe_train_time_sec": lm_results["bpe"][2],
-                "spectral_bpb": lm_results["spectralbpe"][0],
-                "spectral_avg_seq_len": lm_results["spectralbpe"][1],
-                "spectral_train_time_sec": lm_results["spectralbpe"][2],
-                "eval_bytes": lm_results["eval_bytes"],
-            }
+        num_merges = {}
+        if bpe_merges is not None:
+            num_merges["bpe"] = len(bpe_merges)
+        if sp_merges is not None:
+            num_merges["spectralbpe"] = len(sp_merges)
+        if num_merges:
+            payload["num_merges"] = num_merges
+        if do_uni and unigram_model_prefix is not None:
+            payload["unigram_model"] = unigram_model_prefix + ".model"
+        if lm_results:
+            lm_payload = {"eval_bytes": lm_eval_bytes}
+            if "bpe" in lm_results:
+                lm_payload.update(
+                    {
+                        "bpe_bpb": lm_results["bpe"][0],
+                        "bpe_avg_seq_len": lm_results["bpe"][1],
+                        "bpe_train_time_sec": lm_results["bpe"][2],
+                    }
+                )
+            if "spectralbpe" in lm_results:
+                lm_payload.update(
+                    {
+                        "spectral_bpb": lm_results["spectralbpe"][0],
+                        "spectral_avg_seq_len": lm_results["spectralbpe"][1],
+                        "spectral_train_time_sec": lm_results["spectralbpe"][2],
+                    }
+                )
+            if "unigram" in lm_results:
+                lm_payload.update(
+                    {
+                        "unigram_bpb": lm_results["unigram"][0],
+                        "unigram_avg_seq_len": lm_results["unigram"][1],
+                        "unigram_train_time_sec": lm_results["unigram"][2],
+                    }
+                )
+            payload["lm"] = lm_payload
         with open(args.out_json, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
         print(f"[out] wrote {args.out_json}", file=sys.stderr)
