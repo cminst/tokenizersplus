@@ -578,7 +578,9 @@ def train_spectral_bpe(
         if not N_dir:
             break
 
-        _, W_dir, W_und = ppmi_and_weights(N_dir, tau, alpha, beta)
+        # Build the spectral graph from "true" association (PPMI) only.
+        # We do NOT want a beta-floor here because it can turn the spectrum into a frequency graph.
+        ppmi_dir, _, W_und = ppmi_and_weights(N_dir, tau, alpha, beta=0.0)
         tokens = sorted(symbol_set(vocab))
         z = fiedler(tokens, W_und, eig_k=eig_k, eig_eps=eig_eps)
 
@@ -586,26 +588,29 @@ def train_spectral_bpe(
         coherences = []
         z00_pairs = 0
 
-        # We need to consider ALL pairs, not just those with high PPMI
         for (a, b), n_ab in N_dir.items():
-            w = W_dir.get((a, b), 0.0)
+            # ALWAYS apply spectral coherence (this is the whole point).
+            za = z.get(a, 0.0)
+            zb = z.get(b, 0.0)
+            if za == 0.0 and zb == 0.0:
+                z00_pairs += 1
+            dz2 = (za - zb) ** 2
+            coh = math.exp(-dz2 / sigma2) if sigma2 > 0 else 1.0
+            coherences.append(coh)
 
-            if w > 0.0:
-                # Spectral Case: Strong signal
-                za = z.get(a, 0.0)
-                zb = z.get(b, 0.0)
-                if za == 0.0 and zb == 0.0:
-                    z00_pairs += 1
-                dz2 = (za - zb) ** 2
-                coh = math.exp(-dz2 / sigma2) if sigma2 > 0 else 1.0
-                coherences.append(coh)
+            # Association term: use PPMI when count is reliable; otherwise treat as 0.
+            pp = ppmi_dir.get((a, b), 0.0)
+            if n_ab < tau:
+                pp = 0.0
 
-                # Score = Frequency * PPMI * Coherence
-                s = float(n_ab) * w * coh
-            else:
-                # Fallback Case: No spectral signal (rare or low PPMI)
-                # Fall back to raw frequency (Standard BPE behavior)
-                s = float(n_ab) * 1.0
+            # If pp=0 and beta=0, we still want a frequency-driven score,
+            # but now it is *spectral-aware* via coh.
+            assoc = pp + beta
+            if assoc <= 0.0:
+                assoc = 1.0
+
+            # IMPORTANT: don’t double-count frequency; use n_ab**alpha as the frequency weight.
+            s = (float(n_ab) ** alpha) * assoc * coh
 
             if s > 0 and math.isfinite(s):
                 scored.append((s, (a, b)))
