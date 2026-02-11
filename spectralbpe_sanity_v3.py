@@ -1,0 +1,1622 @@
+#!/usr/bin/env python3
+# Sanity-check: compare standard frequency-BPE vs SpectralBPE on intrinsic tokenizer metrics
+# (bytes/token, fertility, PCW, NSL vs BPE) + a small interpretability dump.
+# Optional: train a tiny LM for a generalization test (requires torch).
+#
+# Requirements:
+#   pip install numpy scipy
+#   pip install sentencepiece  # only needed for --methods unigram
+#   pip install torch  # only needed for --train_lm
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import random
+import re
+import shlex
+import sys
+import tempfile
+import time
+from collections import Counter, defaultdict
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Set, Any
+
+import numpy as np
+
+try:
+    from scipy.sparse import csr_matrix, diags, identity
+    from scipy.sparse.linalg import eigsh
+except Exception as e:
+    raise RuntimeError("This script needs scipy (scipy.sparse + eigsh). Install: pip install scipy") from e
+
+END_WORD = "</w>"
+ALLOWED_METHODS = ("bpe", "spectralbpe", "unigram")
+METHOD_LABELS = {
+    "bpe": "BPE",
+    "spectralbpe": "SpectralBPE",
+    "unigram": "Unigram",
+}
+
+
+def parse_methods(methods_arg: Optional[str]) -> List[str]:
+    if not methods_arg:
+        return list(ALLOWED_METHODS)
+    parts = [p.strip().lower() for p in methods_arg.split(",")]
+    parts = [p for p in parts if p]
+    if not parts:
+        return list(ALLOWED_METHODS)
+    unknown = [p for p in parts if p not in ALLOWED_METHODS]
+    if unknown:
+        raise ValueError(f"Unknown --methods entries: {', '.join(unknown)}")
+    seen = set()
+    out = []
+    for p in parts:
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
+# ---------- I/O ----------
+def iter_lines(path: str, max_lines: Optional[int]) -> Iterator[str]:
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for i, line in enumerate(f):
+            if max_lines is not None and i >= max_lines:
+                break
+            yield line.rstrip("\n")
+
+
+def pretokenize(line: str, mode: str) -> List[str]:
+    line = line.strip()
+    if not line:
+        return []
+    if mode == "whitespace":
+        return line.split()
+    if mode == "basic":
+        return re.findall(r"\w+|[^\w\s]", line, flags=re.UNICODE)
+    raise ValueError(f"Unknown --pretokenize={mode}")
+
+
+def build_word_freq(lines: Iterable[str], mode: str, lowercase: bool) -> Counter:
+    c = Counter()
+    for line in lines:
+        if lowercase:
+            line = line.lower()
+        for w in pretokenize(line, mode):
+            if w:
+                c[w] += 1
+    return c
+
+
+def word_to_syms(word: str) -> Tuple[str, ...]:
+    if not word:
+        return tuple()
+    chars = list(word)
+    chars[-1] = chars[-1] + END_WORD
+    return tuple(chars)
+
+
+def strip_end(tokens: Sequence[str]) -> List[str]:
+    out = []
+    for t in tokens:
+        out.append(t[:-len(END_WORD)] if t.endswith(END_WORD) else t)
+    return out
+
+
+def write_checkpoint(
+    checkpoint_dir: Optional[str],
+    algo: str,
+    merges: List[Tuple[str, str]],
+    step: int,
+    config: Dict[str, Any],
+    seed: Optional[int] = None,
+    tag: Optional[str] = None,
+) -> None:
+    if not checkpoint_dir:
+        return
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    write_training_command(checkpoint_dir)
+    seed_tag = f"_seed{seed}" if seed is not None else ""
+    if tag:
+        fname = f"{algo}{seed_tag}_{tag}.json"
+    else:
+        fname = f"{algo}{seed_tag}_merges_{step:06d}.json"
+    path = os.path.join(checkpoint_dir, fname)
+    payload = {
+        "algo": algo,
+        "seed": seed,
+        "num_merges": len(merges),
+        "merges": [list(p) for p in merges],
+        "config": config,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f"[checkpoint] wrote {path}", file=sys.stderr)
+
+
+def write_training_command(checkpoint_dir: str) -> None:
+    path = os.path.join(checkpoint_dir, "train_command.txt")
+    if os.path.exists(path):
+        return
+    cmd = " ".join(shlex.quote(arg) for arg in sys.argv)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(cmd + "\n")
+
+
+# ---------- BPE training ----------
+def init_vocab(word_freq: Counter) -> Dict[Tuple[str, ...], int]:
+    vocab = defaultdict(int)
+    for w, f in word_freq.items():
+        syms = word_to_syms(w)
+        if syms:
+            vocab[syms] += int(f)
+    return dict(vocab)
+
+
+def symbol_set(vocab: Dict[Tuple[str, ...], int]) -> Set[str]:
+    s: Set[str] = set()
+    for seq in vocab:
+        s.update(seq)
+    return s
+
+
+def pair_counts(vocab: Dict[Tuple[str, ...], int]) -> Counter:
+    c = Counter()
+    for seq, freq in vocab.items():
+        for i in range(len(seq) - 1):
+            c[(seq[i], seq[i + 1])] += freq
+    return c
+
+
+def merge_seq(seq: Tuple[str, ...], pair: Tuple[str, str]) -> Tuple[str, ...]:
+    a, b = pair
+    ab = a + b
+    out: List[str] = []
+    i = 0
+    while i < len(seq):
+        if i < len(seq) - 1 and seq[i] == a and seq[i + 1] == b:
+            out.append(ab)
+            i += 2
+        else:
+            out.append(seq[i])
+            i += 1
+    return tuple(out)
+
+
+def apply_merge(vocab: Dict[Tuple[str, ...], int], pair: Tuple[str, str]) -> Dict[Tuple[str, ...], int]:
+    new = defaultdict(int)
+    for seq, freq in vocab.items():
+        new[merge_seq(seq, pair)] += freq
+    return dict(new)
+
+
+def train_bpe(
+    word_freq: Counter,
+    vocab_size: int,
+    max_merges: Optional[int],
+    checkpoint_cb: Optional[Callable[[int, List[Tuple[str, str]]], None]] = None,
+    checkpoint_every: Optional[int] = None,
+) -> List[Tuple[str, str]]:
+    vocab = init_vocab(word_freq)
+    init_syms = symbol_set(vocab)
+    target = vocab_size - len(init_syms)
+    if max_merges is not None:
+        target = min(target, max_merges)
+
+    merges: List[Tuple[str, str]] = []
+    for it in range(max(0, target)):
+        pc = pair_counts(vocab)
+        if not pc:
+            break
+        pair, _ = pc.most_common(1)[0]
+        vocab = apply_merge(vocab, pair)
+        merges.append(pair)
+        if checkpoint_cb is not None and checkpoint_every and len(merges) % checkpoint_every == 0:
+            checkpoint_cb(len(merges), merges)
+        if (it + 1) % 200 == 0:
+            print(f"[BPE] merges={it+1}/{target}", file=sys.stderr)
+    return merges
+
+
+# ---------- Unigram (SentencePiece) ----------
+def _normalize_line_for_spm(line: str, pre_mode: str, lowercase: bool) -> str:
+    if lowercase:
+        line = line.lower()
+    toks = pretokenize(line, pre_mode)
+    return " ".join(toks)
+
+
+def _write_spm_input(lines: Sequence[str], pre_mode: str, lowercase: bool, path: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for line in lines:
+            norm = _normalize_line_for_spm(line, pre_mode, lowercase)
+            if norm:
+                f.write(norm + "\n")
+
+
+def train_sentencepiece_unigram(
+    train_lines: Sequence[str],
+    pre_mode: str,
+    lowercase: bool,
+    vocab_size: int,
+    model_prefix: Optional[str] = None,
+) -> Tuple[Any, str, Optional[tempfile.TemporaryDirectory]]:
+    try:
+        import sentencepiece as spm
+    except Exception as e:
+        raise RuntimeError(
+            "SentencePiece is required for the unigram baseline. Install: pip install sentencepiece"
+        ) from e
+
+    if model_prefix is not None:
+        model_file = model_prefix + ".model"
+        if os.path.exists(model_file):
+            sp = spm.SentencePieceProcessor(model_file=model_file)
+            return sp, model_prefix, None
+
+    tmpdir = None
+    if model_prefix is None:
+        tmpdir = tempfile.TemporaryDirectory()
+        model_prefix = os.path.join(tmpdir.name, "unigram")
+
+    input_path = model_prefix + ".train.txt"
+    _write_spm_input(train_lines, pre_mode, lowercase, input_path)
+
+    spm.SentencePieceTrainer.train(
+        input=input_path,
+        model_prefix=model_prefix,
+        vocab_size=vocab_size,
+        model_type="unigram",
+        character_coverage=1.0,
+        hard_vocab_limit=False,
+    )
+    sp = spm.SentencePieceProcessor(model_file=model_prefix + ".model")
+    return sp, model_prefix, tmpdir
+
+
+def encode_word_sp(sp, word: str) -> List[str]:
+    if not word:
+        return []
+    if hasattr(sp, "encode"):
+        return sp.encode(word, out_type=str)
+    return sp.EncodeAsPieces(word)
+
+
+def evaluate_unigram(
+    sp,
+    eval_lines: Iterable[str],
+    pre_mode: str,
+    lowercase: bool,
+    max_examples: int = 20000,
+) -> Tuple[Dict[str, float], Dict[str, List[str]]]:
+    total_bytes = 0
+    total_words = 0
+    total_tokens = 0
+    continued = 0
+    uniq: Set[str] = set()
+    tok_char_sum = 0
+    examples: Dict[str, List[str]] = {}
+
+    for line in eval_lines:
+        if lowercase:
+            line = line.lower()
+        total_bytes += len(line.encode("utf-8", errors="ignore"))
+        for w in pretokenize(line, pre_mode):
+            if not w:
+                continue
+            t = encode_word_sp(sp, w)
+            total_words += 1
+            total_tokens += len(t)
+            if len(t) >= 2:
+                continued += 1
+            for x in t:
+                uniq.add(x)
+                tok_char_sum += len(x)
+            if len(examples) < max_examples and w not in examples:
+                examples[w] = t
+
+    fert = total_tokens / total_words if total_words else 0.0
+    pcw = continued / total_words if total_words else 0.0
+    bpt = total_bytes / total_tokens if total_tokens else 0.0
+    tpb = total_tokens / total_bytes if total_bytes else 0.0
+    atl = tok_char_sum / total_tokens if total_tokens else 0.0
+
+    metrics = {
+        "bytes": float(total_bytes),
+        "words": float(total_words),
+        "tokens": float(total_tokens),
+        "bytes_per_token": float(bpt),
+        "tokens_per_byte": float(tpb),
+        "fertility": float(fert),
+        "pcw": float(pcw),
+        "avg_token_chars": float(atl),
+        "unique_tokens_used": float(len(uniq)),
+    }
+    return metrics, examples
+
+
+# ---------- SpectralBPE training ----------
+def sym_key(a: str, b: str) -> Tuple[str, str]:
+    return (a, b) if a <= b else (b, a)
+
+
+def ppmi_and_weights(
+    N_dir: Counter, tau: int, alpha: float, beta: float = 0.0
+) -> Tuple[Dict[Tuple[str, str], float], Dict[Tuple[str, str], float], Dict[Tuple[str, str], float]]:
+    """
+    From directed adjacency counts N(i,j), compute:
+      ppmi_dir[(i,j)] = max(0, log p(i,j) / (p(i)p(j)) )
+      W_dir[(i,j)]    = 1{N>=tau} * (ppmi_dir + beta) * N^alpha   (for merge scoring)
+      W_und[{i,j}]    = W_dir(i,j) + W_dir(j,i)          (for spectral embedding)
+
+    beta: baseline added to PPMI to prevent hard gating (beta=0 recovers original behavior)
+    """
+    total = float(sum(N_dir.values()))
+    if total <= 0:
+        return {}, {}, {}
+
+    out_m = Counter()
+    in_m = Counter()
+    for (a, b), c in N_dir.items():
+        out_m[a] += c
+        in_m[b] += c
+
+    ppmi_dir: Dict[Tuple[str, str], float] = {}
+    W_dir: Dict[Tuple[str, str], float] = {}
+    W_und: Dict[Tuple[str, str], float] = defaultdict(float)
+
+    for (a, b), c in N_dir.items():
+        p_ab = c / total
+        p_a = out_m[a] / total
+        p_b = in_m[b] / total
+        denom = p_a * p_b
+        if p_ab <= 0 or denom <= 0:
+            continue
+
+        pmi = math.log(p_ab / denom)
+        ppmi = max(0.0, pmi)
+        ppmi_dir[(a, b)] = ppmi
+
+        if c >= tau:
+            ppmi_eff = ppmi + beta
+            w = ppmi_eff * (float(c) ** alpha)
+            W_dir[(a, b)] = w
+            W_und[sym_key(a, b)] += w
+
+    return ppmi_dir, W_dir, dict(W_und)
+
+
+def fiedler(tokens: List[str], W_und: Dict[Tuple[str, str], float], eig_k: int, eig_eps: float) -> Dict[str, float]:
+    n = len(tokens)
+    if n <= 1:
+        return {t: 0.0 for t in tokens}
+
+    # 1. Build Adjacency Matrix
+    idx = {t: i for i, t in enumerate(tokens)}
+    rows, cols, data = [], [], []
+    for (a, b), w in W_und.items():
+        if a in idx and b in idx and a != b:
+            i, j = idx[a], idx[b]
+            rows.append(i); cols.append(j); data.append(w)
+            rows.append(j); cols.append(i); data.append(w)
+
+    if not data:
+        return {t: 0.0 for t in tokens}
+
+    A = csr_matrix((data, (rows, cols)), shape=(n, n), dtype=np.float64)
+
+    # 2. Extract Largest Connected Component (LCC)
+    # Spectral geometry is only defined within a component.
+    # Distances between components are infinite/undefined.
+    from scipy.sparse.csgraph import connected_components
+    n_components, labels = connected_components(csgraph=A, directed=False, return_labels=True)
+
+    # If fragmented, only solve for the largest chunk
+    counts = Counter(labels)
+    largest_cc_label = counts.most_common(1)[0][0]
+    lcc_indices = np.where(labels == largest_cc_label)[0]
+
+    if len(lcc_indices) < 2:
+        return {t: 0.0 for t in tokens}
+
+    # Create sub-matrix for LCC
+    A_lcc = A[lcc_indices][:, lcc_indices]
+    n_lcc = A_lcc.shape[0]
+
+    # 3. Compute Laplacian for LCC
+    deg = np.asarray(A_lcc.sum(axis=1)).ravel()
+    # Add epsilon to degree to prevent div/0 in degenerate cases
+    deg[deg == 0] = 1e-10
+    inv_sqrt = 1.0 / np.sqrt(deg)
+    D_inv_sqrt = diags(inv_sqrt)
+    L = identity(n_lcc, format="csr") - (D_inv_sqrt @ A_lcc @ D_inv_sqrt)
+
+    # 4. Robust Eigensolve
+    # We only need the first non-trivial vector.
+    # Since we isolated LCC, the only 0 eigenvalue is the first one.
+    # We want the second one (Fiedler).
+    k_target = min(eig_k, n_lcc - 1) if n_lcc > 2 else 1
+
+    try:
+        # 'SA' (Smallest Algebraic) is often more stable than 'SM' for Laplacians
+        # We ask for k+1 to safely skip the null vector
+        vals, vecs = eigsh(L, k=k_target+1, which="SA", tol=eig_eps)
+
+        # Sort and pick the first vector that is definitely non-zero
+        order = np.argsort(vals)
+        vals, vecs = vals[order], vecs[:, order]
+
+        # Skip eigenvalues near zero (tolerance 1e-5 usually safe for normalized laplacian)
+        sel = 0
+        while sel < len(vals) and vals[sel] < 1e-5:
+            sel += 1
+
+        if sel < len(vals):
+            v_lcc = vecs[:, sel]
+        else:
+            # Fallback if solver returns all zeros
+            v_lcc = np.zeros(n_lcc)
+
+    except Exception as e:
+        print(f"[WARNING] Solver failed on LCC (size {n_lcc}): {e}", file=sys.stderr)
+        v_lcc = np.zeros(n_lcc)
+
+    # 5. Map back to tokens
+    # Tokens outside LCC get 0.0 embedding (neutral)
+    z_map = {t: 0.0 for t in tokens}
+    for local_idx, global_idx in enumerate(lcc_indices):
+        z_map[tokens[global_idx]] = float(v_lcc[local_idx])
+
+    return z_map
+
+
+def select_conflict_free(scored: List[Tuple[float, Tuple[str, str]]], batch_size: int, rng: random.Random, deterministic: bool = False) -> List[Tuple[str, str]]:
+    """
+    Conservative 'conflict-free' selection:
+      no token type can appear in more than one selected pair within the batch.
+
+    deterministic: if True, skip the random shuffle of equal-score ties
+    """
+    selected: List[Tuple[str, str]] = []
+    used: Set[str] = set()
+    i = 0
+    while i < len(scored) and len(selected) < batch_size:
+        s0 = scored[i][0]
+        j = i
+        while j < len(scored) and scored[j][0] == s0:
+            j += 1
+        group = scored[i:j]
+        if not deterministic:
+            rng.shuffle(group)
+        for _, (a, b) in group:
+            if len(selected) >= batch_size:
+                break
+            if a in used or b in used:
+                continue
+            used.add(a)
+            used.add(b)
+            selected.append((a, b))
+        i = j
+    return selected
+
+
+def train_spectral_bpe(
+    word_freq: Counter,
+    vocab_size: int,
+    tau: int,
+    alpha: float,
+    sigma: float,
+    batch_size: int,
+    eig_k: int,
+    eig_eps: float,
+    seed: int,
+    max_merges: Optional[int],
+    beta: float = 0.0,
+    sigma_auto: bool = False,
+    deterministic_ties: bool = False,
+    bpe_warmstart: int = 0,
+    coh_lambda: float = 0.15,
+    rerank_top: int = 20000,
+    ppmi_gamma: float = 0.5,
+    embed_alpha: float = 0.0,
+    embed_beta: float = 0.0,
+    sigma_percentile: float = 90.0,
+    checkpoint_cb: Optional[Callable[[int, List[Tuple[str, str]]], None]] = None,
+    checkpoint_every: Optional[int] = None,
+) -> Tuple[List[Tuple[str, str]], Dict[str, Any]]:
+    rng = random.Random(seed)
+    vocab = init_vocab(word_freq)
+    init_syms = symbol_set(vocab)
+    target = vocab_size - len(init_syms)
+    if max_merges is not None:
+        target = min(target, max_merges)
+
+    # Debug: initial graph stats for interpretability
+    init_dir = pair_counts(vocab)
+    init_ppmi_dir, _, init_W_und = ppmi_and_weights(init_dir, tau, embed_alpha, embed_beta)
+    init_tokens = sorted(symbol_set(vocab))
+    init_z = fiedler(init_tokens, init_W_und, eig_k=eig_k, eig_eps=eig_eps)
+    debug = {"init_dir": init_dir, "init_ppmi_dir": init_ppmi_dir, "init_z": init_z}
+
+    merges: List[Tuple[str, str]] = []
+
+    # BPE warm-start: run plain BPE for first N merges
+    if bpe_warmstart > 0:
+        print(f"[SpectralBPE] warm-start: running {bpe_warmstart} BPE merges first", file=sys.stderr)
+        warmstart_target = min(bpe_warmstart, target)
+        while len(merges) < warmstart_target:
+            N_dir = pair_counts(vocab)
+            if not N_dir:
+                break
+            best_pair = max(N_dir.items(), key=lambda x: x[1])[0]
+            vocab = apply_merge(vocab, best_pair)
+            merges.append(best_pair)
+        print(f"[SpectralBPE] warm-start complete: {len(merges)} merges done", file=sys.stderr)
+
+
+    # Auto-calibrate sigma if requested
+    if sigma_auto:
+        N_dir = pair_counts(vocab)
+        # Calibrate on the *spectral graph edges*, not all raw bigrams (many of which never enter the graph).
+        _, _, W_und = ppmi_and_weights(N_dir, tau, embed_alpha, embed_beta)
+        tokens = sorted(symbol_set(vocab))
+        z = fiedler(tokens, W_und, eig_k=eig_k, eig_eps=eig_eps)
+        dz_vals = [abs(z.get(a, 0.0) - z.get(b, 0.0)) for (a, b) in W_und.keys()]
+        if dz_vals:
+            sigma = float(np.percentile(dz_vals, sigma_percentile))
+            print(
+                f"[SpectralBPE] auto-calibrated sigma = {sigma:.4f} (p{int(sigma_percentile)} of |dz| on graph edges)",
+                file=sys.stderr,
+            )
+        else:
+            sigma = 1.0
+            print("[SpectralBPE] auto-calibration failed, using sigma = 1.0", file=sys.stderr)
+        debug["auto_sigma"] = sigma
+
+    sigma2 = float(sigma) ** 2
+
+    outer = 0
+    coherence_stats = []
+    while len(merges) < max(0, target):
+        outer += 1
+        N_dir = pair_counts(vocab)
+        if not N_dir:
+            break
+
+
+        # Build the spectral graph (embedding) decoupled from merge scoring.
+        # Using embed_alpha=0 makes the geometry depend on association (PPMI) rather than raw frequency.
+        ppmi_dir, _, W_und = ppmi_and_weights(N_dir, tau, embed_alpha, embed_beta)
+        tokens = sorted(symbol_set(vocab))
+        z = fiedler(tokens, W_und, eig_k=eig_k, eig_eps=eig_eps)
+
+        scored: List[Tuple[float, Tuple[str, str]]] = []
+        coherences: List[float] = []
+        z00_pairs = 0
+
+        # Candidate set: keep merges impactful by restricting to frequent pairs.
+        cand_iter = N_dir.most_common(rerank_top) if (rerank_top and rerank_top > 0) else N_dir.items()
+
+        for (a, b), n_ab in cand_iter:
+            if n_ab < tau:
+                continue
+
+            # Association term from PPMI (directed). Beta prevents hard gating.
+            pp = ppmi_dir.get((a, b), 0.0)
+            assoc = pp + beta
+            if ppmi_gamma == 0.0:
+                assoc = 1.0
+            elif ppmi_gamma != 1.0:
+                assoc = (max(0.0, assoc)) ** ppmi_gamma
+
+            # Spectral coherence (soft bias)
+            za = z.get(a, 0.0)
+            zb = z.get(b, 0.0)
+            if za == 0.0 and zb == 0.0:
+                z00_pairs += 1
+            dz2 = (za - zb) ** 2
+            coh = math.exp(-dz2 / sigma2) if sigma2 > 0 else 1.0
+            coherences.append(coh)
+
+            # Blend: coh_lambda=0 recovers count/PPMI-only; coh_lambda=1 is full coherence.
+            mix = (1.0 - coh_lambda) + (coh_lambda * coh)
+
+            # Final score: count-weighted + PPMI, with coherence as a gentle bias.
+            s = (float(n_ab) ** alpha) * assoc * mix
+
+            if s > 0 and math.isfinite(s):
+                scored.append((s, (a, b)))
+
+        if not scored:
+            break
+        scored.sort(key=lambda x: x[0], reverse=True)
+        batch = select_conflict_free(scored, batch_size=batch_size, rng=rng, deterministic=deterministic_ties)
+        if not batch:
+            break
+
+        for pair in batch:
+            if len(merges) >= target:
+                break
+            vocab = apply_merge(vocab, pair)
+            merges.append(pair)
+            if checkpoint_cb is not None and checkpoint_every and len(merges) % checkpoint_every == 0:
+                checkpoint_cb(len(merges), merges)
+
+        # Track coherence statistics
+        if coherences:
+            coherence_stats.append({
+                "outer": outer,
+                "median": float(np.median(coherences)),
+                "p10": float(np.percentile(coherences, 10)),
+                "p90": float(np.percentile(coherences, 90)),
+            })
+
+        if outer == 1 or outer % 10 == 0:
+            if coherences:
+                coh_median = np.median(coherences)
+                coh_p10 = np.percentile(coherences, 10)
+                coh_p90 = np.percentile(coherences, 90)
+                # Sigma diagnostics:
+                # coh = exp(-dz^2 / sigma^2)  =>  |dz| = sqrt(-log(coh) * sigma^2)
+                coh_arr = np.asarray(coherences, dtype=np.float64)
+                coh_clip = np.clip(coh_arr, 1e-300, 1.0)
+                dz = np.sqrt(-np.log(coh_clip) * sigma2) if sigma2 > 0 else np.zeros_like(coh_clip)
+                dz_p50 = float(np.percentile(dz, 50))
+                dz_p75 = float(np.percentile(dz, 75))
+                dz_p90 = float(np.percentile(dz, 90))
+                p75_over_sigma = (dz_p75 / float(sigma)) if float(sigma) > 0 else float("nan")
+
+                z_exact0 = sum(1 for v in z.values() if v == 0.0)
+                z0_frac = (z_exact0 / len(z)) if z else 0.0
+                z00_frac = (z00_pairs / len(coherences)) if coherences else 0.0
+
+                print(
+                    f"[SpectralBPE] outer={outer} merges={len(merges)}/{target} "
+                    f"sigma={float(sigma):.4g} "
+                    f"coh: med={coh_median:.4f} p10={coh_p10:.4f} p90={coh_p90:.4f} "
+                    f"|dz|: p50={dz_p50:.4g} p75={dz_p75:.4g} p90={dz_p90:.4g} "
+                    f"(p75/sigma={p75_over_sigma:.3f}) "
+                    f"z0_frac={z0_frac:.3f} z00_pairs_frac={z00_frac:.3f}",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"[SpectralBPE] outer={outer} merges={len(merges)}/{target}", file=sys.stderr)
+
+    debug["coherence_stats"] = coherence_stats
+
+    return merges, debug
+
+
+# ---------- Encoding ----------
+def adj_pairs(tokens: Sequence[str]) -> Set[Tuple[str, str]]:
+    return {(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)}
+
+
+def merge_once(tokens: Sequence[str], pair: Tuple[str, str]) -> List[str]:
+    a, b = pair
+    ab = a + b
+    out = []
+    i = 0
+    while i < len(tokens):
+        if i < len(tokens) - 1 and tokens[i] == a and tokens[i + 1] == b:
+            out.append(ab)
+            i += 2
+        else:
+            out.append(tokens[i])
+            i += 1
+    return out
+
+
+def encode_word(word: str, rank: Dict[Tuple[str, str], int], keep_end: bool = False) -> List[str]:
+    if not word:
+        return []
+    toks = list(word)
+    toks[-1] = toks[-1] + END_WORD
+    while True:
+        pairs = adj_pairs(toks)
+        best = None
+        best_r = None
+        for p in pairs:
+            r = rank.get(p)
+            if r is None:
+                continue
+            if best_r is None or r < best_r:
+                best_r, best = r, p
+        if best is None:
+            break
+        toks = merge_once(toks, best)
+    return toks if keep_end else strip_end(toks)
+
+
+# ---------- Metrics ----------
+def evaluate(
+    merges: List[Tuple[str, str]],
+    eval_lines: Iterable[str],
+    pre_mode: str,
+    lowercase: bool,
+    max_examples: int = 20000,
+) -> Tuple[Dict[str, float], Dict[str, List[str]]]:
+    rank = {p: i for i, p in enumerate(merges)}
+    total_bytes = 0
+    total_words = 0
+    total_tokens = 0
+    continued = 0
+    uniq: Set[str] = set()
+    tok_char_sum = 0
+    examples: Dict[str, List[str]] = {}
+
+    for line in eval_lines:
+        if lowercase:
+            line = line.lower()
+        total_bytes += len(line.encode("utf-8", errors="ignore"))
+        for w in pretokenize(line, pre_mode):
+            if not w:
+                continue
+            t = encode_word(w, rank)
+            total_words += 1
+            total_tokens += len(t)
+            if len(t) >= 2:
+                continued += 1
+            for x in t:
+                uniq.add(x)
+                tok_char_sum += len(x)
+            if len(examples) < max_examples and w not in examples:
+                examples[w] = t
+
+    fert = total_tokens / total_words if total_words else 0.0
+    pcw = continued / total_words if total_words else 0.0
+    bpt = total_bytes / total_tokens if total_tokens else 0.0
+    tpb = total_tokens / total_bytes if total_bytes else 0.0
+    atl = tok_char_sum / total_tokens if total_tokens else 0.0
+
+    metrics = {
+        "bytes": float(total_bytes),
+        "words": float(total_words),
+        "tokens": float(total_tokens),
+        "bytes_per_token": float(bpt),
+        "tokens_per_byte": float(tpb),
+        "fertility": float(fert),
+        "pcw": float(pcw),
+        "avg_token_chars": float(atl),
+        "unique_tokens_used": float(len(uniq)),
+    }
+    return metrics, examples
+
+
+def print_table(metrics_by_method: Dict[str, Dict[str, float]]) -> None:
+    methods = [m for m in ALLOWED_METHODS if m in metrics_by_method]
+    if not methods:
+        print("\n== Intrinsic sanity-check metrics ==\n(no methods selected)")
+        return
+
+    print("\n== Intrinsic sanity-check metrics ==")
+    header = f"{'Metric':38s} | " + " | ".join(f"{METHOD_LABELS[m]:>12s}" for m in methods)
+    print(header)
+    print("-" * max(70, len(header)))
+
+    def row(name, key, fmt="{:.6f}"):
+        vals = [fmt.format(metrics_by_method[m][key]) for m in methods]
+        print(f"{name:38s} | " + " | ".join(f"{v:>12s}" for v in vals))
+
+    row("Bytes per token (↑)", "bytes_per_token")
+    row("Tokens per byte (↓)", "tokens_per_byte")
+    row("Fertility (tokens/word) (↓)", "fertility")
+    row("PCW = P(word split) (↓)", "pcw")
+    row("Avg token length (chars) (↑)", "avg_token_chars")
+    row("Unique tokens used on eval", "unique_tokens_used", fmt="{:.0f}")
+
+    if "bpe" in metrics_by_method and len(methods) > 1:
+        bpe_tokens = metrics_by_method["bpe"]["tokens"]
+        nsl_vals = []
+        for m in methods:
+            if m == "bpe":
+                nsl_vals.append(1.0)
+            else:
+                nsl_vals.append((metrics_by_method[m]["tokens"] / bpe_tokens) if bpe_tokens else float("nan"))
+        nsl_row = " | ".join(f"{v:12.6f}" for v in nsl_vals)
+        print(f"{'NSL vs BPE (tokens_m/tokens_bpe) (↓)':38s} | {nsl_row}")
+
+    print("-" * max(70, len(header)))
+    base = metrics_by_method[methods[0]]
+    tokens_str = " ".join(
+        f"{METHOD_LABELS[m]}_tokens={int(metrics_by_method[m]['tokens'])}" for m in methods
+    )
+    print(f"Totals: bytes={int(base['bytes'])} words={int(base['words'])} {tokens_str}")
+
+
+# ---------- Interpretability ----------
+def top_diff_words(ex_b: Dict[str, List[str]], ex_s: Dict[str, List[str]], k: int = 12):
+    diffs = []
+    for w, tb in ex_b.items():
+        ts = ex_s.get(w)
+        if ts is None:
+            continue
+        if tb != ts:
+            diffs.append((abs(len(tb) - len(ts)), w, tb, ts))
+    diffs.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return diffs[:k]
+
+def calc_vocab_quality(merges, init_dir, init_ppmi):
+    """
+    Calculates the average statistical strength (PPMI) of the pairs
+    that were chosen to be merged.
+    """
+    scores = []
+    # We only care about merges that actually existed in the initial graph
+    # (i.e. atomic pairs). Later merges (of longer tokens) are harder to track
+    # back to the initial graph without tracking the full history,
+    # but measuring the "Atomic" merges gives us a good proxy for base cohesiveness.
+
+    # Actually, a better proxy is: Look at every merge (a,b) in the list.
+    # If (a,b) is in our initial bigram table, what is its PPMI?
+    hit = 0
+    miss = 0
+    total_ppmi = 0.0
+
+    for (a, b) in merges:
+        if (a, b) in init_dir:
+            p = init_ppmi.get((a, b), 0.0)
+            scores.append(p)
+            total_ppmi += p
+            hit += 1
+        else:
+            # Pair wasn't in initial character graph (it's a merge of merges)
+            miss += 1
+
+    avg_ppmi = total_ppmi / hit if hit > 0 else 0.0
+    return avg_ppmi, hit, miss
+
+def interpretability(
+    bpe_merges: List[Tuple[str, str]],
+    sp_merges: List[Tuple[str, str]],
+    ex_b: Dict[str, List[str]],
+    ex_s: Dict[str, List[str]],
+    debug: Dict[str, Any],
+    sigma: float,
+    top_merges: int = 20,
+) -> None:
+    print("\n== Interpretability ==")
+    print(f"\nTop {top_merges} merges:")
+    print(f"{'r':>3s} | {'BPE':24s} | {'SpectralBPE':24s}")
+    print("-" * 60)
+    for i in range(top_merges):
+        bm = bpe_merges[i] if i < len(bpe_merges) else None
+        sm = sp_merges[i] if i < len(sp_merges) else None
+        print(f"{i:3d} | {str(bm):24s} | {str(sm):24s}")
+
+    print("\nWords with largest |Δtokens| in stored examples:")
+    diffs = top_diff_words(ex_b, ex_s, k=12)
+    if not diffs:
+        print("  (No differences found in stored examples.)")
+    for gap, w, tb, ts in diffs:
+        print(f"  - {w!r} (|Δ|={gap}):")
+        print(f"      BPE        : {tb}")
+        print(f"      SpectralBPE: {ts}")
+
+    init_dir: Counter = debug.get("init_dir", Counter())
+    init_ppmi: Dict[Tuple[str, str], float] = debug.get("init_ppmi_dir", {})
+    init_z: Dict[str, float] = debug.get("init_z", {})
+    bpe_rank = {p: i for i, p in enumerate(bpe_merges)}
+    sp_rank = {p: i for i, p in enumerate(sp_merges)}
+    sigma2 = sigma * sigma
+
+    cand = []
+    for (a, b), c in init_dir.most_common(500):
+        pp = init_ppmi.get((a, b), 0.0)
+        coh = (
+            math.exp(-((init_z.get(a, 0.0) - init_z.get(b, 0.0)) ** 2) / sigma2)
+            if sigma2 > 0
+            else 1.0
+        )
+        cand.append((c, pp, coh, (a, b)))
+    cand.sort(key=lambda x: (-x[0], x[1], x[2]))
+
+    print("\nHigh-frequency 'bridge-like' initial pairs (high count, low PPMI, low coherence):")
+    print(f"{'pair':24s} | {'cnt':>6s} | {'PPMI':>7s} | {'coh':>6s} | {'BPE_r':>6s} | {'Spec_r':>6s}")
+    print("-" * 70)
+    shown = 0
+    for c, pp, coh, p in cand:
+        if shown >= 15:
+            break
+        if pp > 0.25 and coh > 0.6:
+            continue
+        print(
+            f"{str(p):24s} | {c:6d} | {pp:7.3f} | {coh:6.3f} | "
+            f"{str(bpe_rank.get(p,'-')):>6s} | {str(sp_rank.get(p,'-')):>6s}"
+        )
+        shown += 1
+
+    def merge_stats(merges):
+        ppv, chv = [], []
+        for (a, b) in merges[:200]:
+            if (a, b) not in init_dir:
+                continue
+            ppv.append(init_ppmi.get((a, b), 0.0))
+            chv.append(
+                math.exp(-((init_z.get(a, 0.0) - init_z.get(b, 0.0)) ** 2) / sigma2)
+                if sigma2 > 0
+                else 1.0
+            )
+        if not ppv:
+            return None
+        return float(np.mean(ppv)), float(np.mean(chv)), float(np.median(ppv)), float(np.median(chv))
+
+    bs = merge_stats(bpe_merges)
+    ss = merge_stats(sp_merges)
+    print("\nEarly-merge association/coherence (computed on initial graph, over merges present at char-level):")
+    print("  format: mean_ppmi, mean_coh, median_ppmi, median_coh")
+    print(f"  BPE        : {bs}")
+    print(f"  SpectralBPE: {ss}")
+
+    init_dir = debug.get("init_dir", Counter())
+    init_ppmi = debug.get("init_ppmi_dir", {})
+
+    print("\n== Vocabulary Quality (Statistical Cohesion) ==")
+    b_score, b_n, _ = calc_vocab_quality(bpe_merges, init_dir, init_ppmi)
+    s_score, s_n, _ = calc_vocab_quality(sp_merges, init_dir, init_ppmi)
+
+    print(f"Metric                       | {'BPE':>10} | {'SpectralBPE':>12}")
+    print("-" * 55)
+    print(f"Avg PPMI of Merges (↑)       | {b_score:10.4f} | {s_score:12.4f}")
+    print(f"(Computed on {min(b_n, s_n)} common atomic pairs)")
+
+    if s_score > b_score:
+        diff = ((s_score - b_score) / b_score) * 100
+        print(f"\n[RESULT] SpectralBPE merges are {diff:.1f}% more statistically cohesive.")
+
+
+# ---------- LM Generalization (optional) ----------
+def tokens_from_lines(
+    lines: Sequence[str],
+    merges: List[Tuple[str, str]],
+    pre_mode: str,
+    lowercase: bool,
+) -> Tuple[List[str], List[int]]:
+    rank = {p: i for i, p in enumerate(merges)}
+    tokens: List[str] = []
+    lengths: List[int] = []
+    for line in lines:
+        if lowercase:
+            line = line.lower()
+        line_tokens: List[str] = []
+        for w in pretokenize(line, pre_mode):
+            if not w:
+                continue
+            line_tokens.extend(encode_word(w, rank))
+        if line_tokens:
+            lengths.append(len(line_tokens))
+            tokens.extend(line_tokens)
+    return tokens, lengths
+
+
+def tokens_from_lines_sp(
+    lines: Sequence[str],
+    sp,
+    pre_mode: str,
+    lowercase: bool,
+) -> Tuple[List[str], List[int]]:
+    tokens: List[str] = []
+    lengths: List[int] = []
+    for line in lines:
+        if lowercase:
+            line = line.lower()
+        line_tokens: List[str] = []
+        for w in pretokenize(line, pre_mode):
+            if not w:
+                continue
+            line_tokens.extend(encode_word_sp(sp, w))
+        if line_tokens:
+            lengths.append(len(line_tokens))
+            tokens.extend(line_tokens)
+    return tokens, lengths
+
+
+def build_vocab(tokens: Sequence[str]) -> Tuple[List[str], Dict[str, int]]:
+    uniq = [t for t in sorted(set(tokens)) if t != "<unk>"]
+    vocab = ["<unk>"] + uniq
+    stoi = {t: i for i, t in enumerate(vocab)}
+    return vocab, stoi
+
+
+def iter_lm_batches(
+    ids_tensor,
+    block_size: int,
+    batch_size: int,
+    rng: Optional[random.Random],
+):
+    n = int(ids_tensor.shape[0])
+    num_blocks = (n - 1) // block_size
+    if num_blocks <= 0:
+        return
+    starts = list(range(0, num_blocks * block_size, block_size))
+    if rng is not None:
+        rng.shuffle(starts)
+    for i in range(0, len(starts), batch_size):
+        batch_starts = starts[i:i + batch_size]
+        x = np.stack([ids_tensor[s:s + block_size] for s in batch_starts], axis=0)
+        y = np.stack([ids_tensor[s + 1:s + block_size + 1] for s in batch_starts], axis=0)
+        yield x, y
+
+
+def train_and_eval_lm(
+    train_lines: Sequence[str],
+    eval_lines: Sequence[str],
+    merges: List[Tuple[str, str]],
+    pre_mode: str,
+    lowercase: bool,
+    eval_bytes: int,
+    epochs: int,
+    batch_size: int,
+    block_size: int,
+    n_embd: int,
+    n_head: int,
+    n_layer: int,
+    lr: float,
+    seed: int,
+) -> Tuple[float, float, float]:
+    train_tokens, _ = tokens_from_lines(train_lines, merges, pre_mode, lowercase)
+    eval_tokens, eval_lengths = tokens_from_lines(eval_lines, merges, pre_mode, lowercase)
+    return train_and_eval_lm_from_tokens(
+        train_tokens=train_tokens,
+        eval_tokens=eval_tokens,
+        eval_lengths=eval_lengths,
+        eval_bytes=eval_bytes,
+        epochs=epochs,
+        batch_size=batch_size,
+        block_size=block_size,
+        n_embd=n_embd,
+        n_head=n_head,
+        n_layer=n_layer,
+        lr=lr,
+        seed=seed,
+    )
+
+
+def train_and_eval_lm_sp(
+    train_lines: Sequence[str],
+    eval_lines: Sequence[str],
+    sp,
+    pre_mode: str,
+    lowercase: bool,
+    eval_bytes: int,
+    epochs: int,
+    batch_size: int,
+    block_size: int,
+    n_embd: int,
+    n_head: int,
+    n_layer: int,
+    lr: float,
+    seed: int,
+) -> Tuple[float, float, float]:
+    train_tokens, _ = tokens_from_lines_sp(train_lines, sp, pre_mode, lowercase)
+    eval_tokens, eval_lengths = tokens_from_lines_sp(eval_lines, sp, pre_mode, lowercase)
+    return train_and_eval_lm_from_tokens(
+        train_tokens=train_tokens,
+        eval_tokens=eval_tokens,
+        eval_lengths=eval_lengths,
+        eval_bytes=eval_bytes,
+        epochs=epochs,
+        batch_size=batch_size,
+        block_size=block_size,
+        n_embd=n_embd,
+        n_head=n_head,
+        n_layer=n_layer,
+        lr=lr,
+        seed=seed,
+    )
+
+
+def train_and_eval_lm_from_tokens(
+    train_tokens: Sequence[str],
+    eval_tokens: Sequence[str],
+    eval_lengths: Sequence[int],
+    eval_bytes: int,
+    epochs: int,
+    batch_size: int,
+    block_size: int,
+    n_embd: int,
+    n_head: int,
+    n_layer: int,
+    lr: float,
+    seed: int,
+) -> Tuple[float, float, float]:
+    try:
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+    except Exception as e:
+        raise RuntimeError("Torch is required for --train_lm. Install: pip install torch") from e
+
+    avg_seq_len = (sum(eval_lengths) / len(eval_lengths)) if eval_lengths else 0.0
+
+    if len(train_tokens) < block_size + 1:
+        raise RuntimeError("Not enough training tokens for the requested --lm_block_size.")
+
+    vocab, stoi = build_vocab(train_tokens)
+    unk_id = stoi["<unk>"]
+    train_ids = np.array([stoi.get(t, unk_id) for t in train_tokens], dtype=np.int64)
+    eval_ids = np.array([stoi.get(t, unk_id) for t in eval_tokens], dtype=np.int64)
+
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    torch.manual_seed(seed)
+    random.seed(seed)
+
+    class MiniTransformerLM(nn.Module):
+        def __init__(self, vocab_size: int):
+            super().__init__()
+            self.token_emb = nn.Embedding(vocab_size, n_embd)
+            self.pos_emb = nn.Embedding(block_size, n_embd)
+            enc_layer = nn.TransformerEncoderLayer(
+                d_model=n_embd,
+                nhead=n_head,
+                dim_feedforward=4 * n_embd,
+                dropout=0.1,
+                batch_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layer)
+            self.ln = nn.LayerNorm(n_embd)
+            self.head = nn.Linear(n_embd, vocab_size, bias=False)
+
+        def forward(self, idx):
+            bsz, t = idx.shape
+            pos = torch.arange(t, device=idx.device).unsqueeze(0)
+            x = self.token_emb(idx) + self.pos_emb(pos)
+            mask = torch.triu(torch.ones(t, t, device=idx.device), diagonal=1).bool()
+            x = self.encoder(x, mask)
+            x = self.ln(x)
+            return self.head(x)
+
+    model = MiniTransformerLM(len(vocab)).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+
+    model.train()
+    t0 = time.perf_counter()
+    for epoch in range(epochs):
+        rng = random.Random(seed + epoch)
+        for x_np, y_np in iter_lm_batches(train_ids, block_size, batch_size, rng):
+            x = torch.from_numpy(x_np).to(device)
+            y = torch.from_numpy(y_np).to(device)
+            logits = model(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+    train_time = time.perf_counter() - t0
+
+    model.eval()
+    eval_block_size = min(block_size, len(eval_ids) - 1) if len(eval_ids) > 1 else 0
+    if eval_block_size <= 0:
+        raise RuntimeError("Not enough evaluation tokens for LM evaluation.")
+
+    total_loss = 0.0
+    with torch.no_grad():
+        for x_np, y_np in iter_lm_batches(eval_ids, eval_block_size, batch_size, None):
+            x = torch.from_numpy(x_np).to(device)
+            y = torch.from_numpy(y_np).to(device)
+            logits = model(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), reduction="sum")
+            total_loss += float(loss.item())
+
+    if eval_bytes <= 0:
+        bpb = float("nan")
+    else:
+        bpb = (total_loss / float(eval_bytes)) / math.log(2.0)
+
+    return bpb, avg_seq_len, train_time
+
+
+def print_lm_table(lm_by_method: Dict[str, Tuple[float, float, float]]) -> None:
+    methods = [m for m in ALLOWED_METHODS if m in lm_by_method]
+    if not methods:
+        print("\n== LM generalization (BPB) ==\n(no methods selected)")
+        return
+
+    print("\n== LM generalization (BPB) ==")
+    header = f"{'Metric':24s} | " + " | ".join(f"{METHOD_LABELS[m]:>12s}" for m in methods)
+    print(header)
+    print("-" * max(56, len(header)))
+
+    def row(name: str, idx: int, fmt: str):
+        vals = [fmt.format(lm_by_method[m][idx]) for m in methods]
+        print(f"{name:24s} | " + " | ".join(f"{v:>12s}" for v in vals))
+
+    row("BPB (eval)", 0, "{:.6f}")
+    row("Avg tokens/sent", 1, "{:.2f}")
+    row("Training time (s)", 2, "{:.2f}")
+
+
+# ---------- Main ----------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--train_text", required=True)
+    ap.add_argument("--eval_text", required=True)
+    ap.add_argument("--vocab_size", type=int, default=8000)
+    ap.add_argument("--pretokenize", choices=["whitespace", "basic"], default="whitespace")
+    ap.add_argument("--lowercase", action="store_true")
+    ap.add_argument("--max_train_lines", type=int, default=None)
+    ap.add_argument("--max_eval_lines", type=int, default=None)
+    ap.add_argument("--max_merges", type=int, default=None)
+    ap.add_argument(
+        "--methods",
+        type=str,
+        default=None,
+        help="Comma-separated list of methods to run: bpe,spectralbpe,unigram (default: all)",
+    )
+    ap.add_argument(
+        "--unigram_model_prefix",
+        type=str,
+        default=None,
+        help="Prefix for SentencePiece Unigram model files (default: checkpoint_dir/unigram or temp)",
+    )
+
+    # SpectralBPE params
+    ap.add_argument("--tau", type=int, default=2, help="Minimum pair count threshold (default: 2, was 5)")
+    ap.add_argument("--alpha", type=float, default=0.25, help="Frequency exponent (default: 0.25, was 0.5)")
+    ap.add_argument("--sigma", type=float, default=1.0, help="Coherence bandwidth (ignored if --sigma_auto)")
+    ap.add_argument("--batch_size", type=int, default=25)
+    ap.add_argument("--eig_k", type=int, default=8)
+    ap.add_argument("--eig_eps", type=float, default=1e-8)
+    ap.add_argument("--seed", type=int, default=0)
+
+    # New params for improvements
+    ap.add_argument("--beta", type=float, default=0.05, help="PPMI baseline to avoid hard gating (default: 0.05)")
+    ap.add_argument("--sigma_auto", action="store_true", help="Auto-calibrate sigma from spectral coordinate differences")
+    ap.add_argument("--deterministic_ties", action="store_true", help="Disable random shuffle of equal-score ties")
+    ap.add_argument("--bpe_warmstart", type=int, default=0, help="Number of plain BPE merges before spectral guidance")
+    ap.add_argument("--num_seeds", type=int, default=1, help="Run with multiple seeds and report stats")
+
+
+    # SpectralBPE scoring controls (to avoid wasting merges on rare-but-cohesive pairs)
+    ap.add_argument("--coh_lambda", type=float, default=0.15,
+                    help="Blend weight for spectral coherence in merge scoring (0=BPE-like, 1=full coherence)")
+    ap.add_argument("--rerank_top", type=int, default=20000,
+                    help="Only score the top-N pairs by raw count each batch (0 disables; recommended to keep >= 5000)")
+    ap.add_argument("--ppmi_gamma", type=float, default=0.5,
+                    help="Exponent applied to (PPMI+beta) in merge scoring (0 ignores PPMI; <1 compresses range)")
+
+    # Spectral graph construction controls (decouple embedding from frequency)
+    ap.add_argument("--embed_alpha", type=float, default=0.0,
+                    help="Count exponent used when constructing the spectral graph (0=PPMI-only embedding)")
+    ap.add_argument("--embed_beta", type=float, default=0.0,
+                    help="PPMI baseline used only for constructing the spectral graph")
+    ap.add_argument("--sigma_percentile", type=float, default=90.0,
+                    help="Percentile of |dz| on spectral-graph edges used for --sigma_auto")
+
+    # Checkpointing
+    ap.add_argument("--checkpoint_dir", type=str, default=None, help="Directory to write tokenizer merge checkpoints (JSON)")
+    ap.add_argument("--checkpoint_every", type=int, default=0, help="Save a checkpoint every N merges (0 disables)")
+
+    # Optional LM generalization test
+    ap.add_argument("--train_lm", action="store_true", help="Train a tiny LM and report BPB on eval.txt")
+    ap.add_argument("--lm_epochs", type=int, default=2)
+    ap.add_argument("--lm_batch_size", type=int, default=16)
+    ap.add_argument("--lm_block_size", type=int, default=128)
+    ap.add_argument("--lm_dim", type=int, default=128)
+    ap.add_argument("--lm_heads", type=int, default=4)
+    ap.add_argument("--lm_layers", type=int, default=2)
+    ap.add_argument("--lm_lr", type=float, default=3e-4)
+
+    ap.add_argument("--out_json", type=str, default=None)
+    args = ap.parse_args()
+
+    try:
+        methods = parse_methods(args.methods)
+    except ValueError as e:
+        ap.error(str(e))
+    if not methods:
+        ap.error("No methods selected.")
+    do_bpe = "bpe" in methods
+    do_sp = "spectralbpe" in methods
+    do_uni = "unigram" in methods
+
+    train_lines = list(iter_lines(args.train_text, args.max_train_lines))
+    eval_lines = list(iter_lines(args.eval_text, args.max_eval_lines))
+    if not train_lines:
+        raise RuntimeError("No training lines found.")
+    if not eval_lines:
+        raise RuntimeError("No evaluation lines found.")
+
+    wf = None
+    if do_bpe or do_sp:
+        wf = build_word_freq(train_lines, args.pretokenize, args.lowercase)
+        if not wf:
+            raise RuntimeError("No words found in training data after pretokenization.")
+
+    checkpoint_every = args.checkpoint_every if args.checkpoint_every and args.checkpoint_every > 0 else None
+
+    def make_checkpoint_cb(algo: str, seed: Optional[int] = None, config_override: Optional[Dict[str, Any]] = None):
+        if not args.checkpoint_dir:
+            return None
+        cfg = dict(vars(args))
+        if config_override:
+            cfg.update(config_override)
+        if seed is not None:
+            cfg["seed"] = seed
+
+        def _cb(step: int, merges: List[Tuple[str, str]]):
+            write_checkpoint(args.checkpoint_dir, algo, merges, step, cfg, seed=seed)
+
+        return _cb
+
+    bpe_merges = None
+    sp_merges = None
+    debug: Dict[str, Any] = {}
+    ex_b: Dict[str, List[str]] = {}
+    ex_s: Dict[str, List[str]] = {}
+    bpe_metrics = None
+    sp_metrics = None
+    uni_metrics = None
+    sp_model = None
+    unigram_tmpdir = None
+    unigram_model_prefix = args.unigram_model_prefix
+
+    if do_bpe:
+        print("[train] BPE...", file=sys.stderr)
+        bpe_cb = make_checkpoint_cb("bpe")
+        bpe_merges = train_bpe(
+            wf,
+            args.vocab_size,
+            args.max_merges,
+            checkpoint_cb=bpe_cb,
+            checkpoint_every=checkpoint_every,
+        )
+        if args.checkpoint_dir:
+            write_checkpoint(args.checkpoint_dir, "bpe", bpe_merges, len(bpe_merges), dict(vars(args)), tag="final")
+
+    if do_sp:
+        # Multi-seed evaluation if requested
+        if args.num_seeds > 1:
+            print(f"[train] SpectralBPE with {args.num_seeds} seeds...", file=sys.stderr)
+            all_sp_metrics = []
+            for seed_i in range(args.num_seeds):
+                current_seed = args.seed + seed_i
+                print(f"[train] SpectralBPE seed {seed_i+1}/{args.num_seeds} (seed={current_seed})...", file=sys.stderr)
+                sp_cb_i = make_checkpoint_cb("spectralbpe", seed=current_seed, config_override={"seed": current_seed})
+                sp_merges_i, debug_i = train_spectral_bpe(
+                    wf,
+                    args.vocab_size,
+                    tau=args.tau,
+                    alpha=args.alpha,
+                    sigma=args.sigma,
+                    batch_size=args.batch_size,
+                    eig_k=args.eig_k,
+                    eig_eps=args.eig_eps,
+                    seed=current_seed,
+                    max_merges=args.max_merges,
+                    beta=args.beta,
+                    sigma_auto=args.sigma_auto,
+                    deterministic_ties=args.deterministic_ties,
+                    bpe_warmstart=args.bpe_warmstart,
+                                        coh_lambda=args.coh_lambda,
+                    rerank_top=args.rerank_top,
+                    ppmi_gamma=args.ppmi_gamma,
+                    embed_alpha=args.embed_alpha,
+                    embed_beta=args.embed_beta,
+                    sigma_percentile=args.sigma_percentile,
+                    checkpoint_cb=sp_cb_i,
+                    checkpoint_every=checkpoint_every,
+                )
+                if args.checkpoint_dir:
+                    write_checkpoint(
+                        args.checkpoint_dir,
+                        "spectralbpe",
+                        sp_merges_i,
+                        len(sp_merges_i),
+                        dict(vars(args), seed=current_seed),
+                        seed=current_seed,
+                        tag="final",
+                    )
+                sp_metrics_i, ex_s_i = evaluate(sp_merges_i, eval_lines, args.pretokenize, args.lowercase)
+                all_sp_metrics.append(sp_metrics_i)
+                if seed_i == 0:
+                    sp_merges, debug, ex_s = sp_merges_i, debug_i, ex_s_i
+
+            # Compute mean and std across seeds
+            keys = ["bytes_per_token", "tokens_per_byte", "fertility", "pcw", "avg_token_chars"]
+            sp_metrics_mean = {}
+            sp_metrics_std = {}
+            for key in keys:
+                values = [m[key] for m in all_sp_metrics]
+                sp_metrics_mean[key] = float(np.mean(values))
+                sp_metrics_std[key] = float(np.std(values))
+
+            print("\n=== Multi-seed Results ===", file=sys.stderr)
+            print(f"Seeds: {args.num_seeds}", file=sys.stderr)
+            for key in keys:
+                print(f"  {key}: {sp_metrics_mean[key]:.6f} ± {sp_metrics_std[key]:.6f}", file=sys.stderr)
+
+            sp_metrics = all_sp_metrics[0]  # Use first seed for comparison table
+        else:
+            print("[train] SpectralBPE...", file=sys.stderr)
+            sp_cb = make_checkpoint_cb("spectralbpe", seed=args.seed, config_override={"seed": args.seed})
+            sp_merges, debug = train_spectral_bpe(
+                wf,
+                args.vocab_size,
+                tau=args.tau,
+                alpha=args.alpha,
+                sigma=args.sigma,
+                batch_size=args.batch_size,
+                eig_k=args.eig_k,
+                eig_eps=args.eig_eps,
+                seed=args.seed,
+                max_merges=args.max_merges,
+                beta=args.beta,
+                sigma_auto=args.sigma_auto,
+                deterministic_ties=args.deterministic_ties,
+                bpe_warmstart=args.bpe_warmstart,
+                                    coh_lambda=args.coh_lambda,
+                    rerank_top=args.rerank_top,
+                    ppmi_gamma=args.ppmi_gamma,
+                    embed_alpha=args.embed_alpha,
+                    embed_beta=args.embed_beta,
+                    sigma_percentile=args.sigma_percentile,
+                    checkpoint_cb=sp_cb,
+                checkpoint_every=checkpoint_every,
+            )
+            if args.checkpoint_dir:
+                write_checkpoint(
+                    args.checkpoint_dir,
+                    "spectralbpe",
+                    sp_merges,
+                    len(sp_merges),
+                    dict(vars(args), seed=args.seed),
+                    seed=args.seed,
+                    tag="final",
+                )
+            sp_metrics, ex_s = evaluate(sp_merges, eval_lines, args.pretokenize, args.lowercase)
+
+    if do_bpe and bpe_merges is not None:
+        bpe_metrics, ex_b = evaluate(bpe_merges, eval_lines, args.pretokenize, args.lowercase)
+
+    if do_uni:
+        if unigram_model_prefix is None and args.checkpoint_dir:
+            unigram_model_prefix = os.path.join(args.checkpoint_dir, "unigram")
+        print("[train] Unigram (SentencePiece)...", file=sys.stderr)
+        sp_model, unigram_model_prefix, unigram_tmpdir = train_sentencepiece_unigram(
+            train_lines,
+            args.pretokenize,
+            args.lowercase,
+            args.vocab_size,
+            model_prefix=unigram_model_prefix,
+        )
+        uni_metrics, _ = evaluate_unigram(sp_model, eval_lines, args.pretokenize, args.lowercase)
+
+    metrics_by_method: Dict[str, Dict[str, float]] = {}
+    if bpe_metrics is not None:
+        metrics_by_method["bpe"] = bpe_metrics
+    if sp_metrics is not None:
+        metrics_by_method["spectralbpe"] = sp_metrics
+    if uni_metrics is not None:
+        metrics_by_method["unigram"] = uni_metrics
+
+    print_table(metrics_by_method)
+    if do_bpe and do_sp and bpe_merges is not None and sp_merges is not None:
+        sigma_val = args.sigma if not args.sigma_auto else debug.get("auto_sigma", args.sigma)
+        interpretability(bpe_merges, sp_merges, ex_b, ex_s, debug, sigma=sigma_val)
+
+    lm_results: Dict[str, Tuple[float, float, float]] = {}
+    lm_eval_bytes = None
+    if args.train_lm:
+        if args.max_eval_lines is None:
+            try:
+                eval_bytes = len(open(args.eval_text, "rb").read())
+            except Exception:
+                eval_bytes = sum(len((line + "\n").encode("utf-8", errors="ignore")) for line in eval_lines)
+        else:
+            eval_bytes = sum(len((line + "\n").encode("utf-8", errors="ignore")) for line in eval_lines)
+        lm_eval_bytes = eval_bytes
+
+        if do_bpe and bpe_merges is not None:
+            print("\n[train] LM on BPE tokens...", file=sys.stderr)
+            bpe_lm = train_and_eval_lm(
+                train_lines,
+                eval_lines,
+                bpe_merges,
+                args.pretokenize,
+                args.lowercase,
+                eval_bytes=eval_bytes,
+                epochs=args.lm_epochs,
+                batch_size=args.lm_batch_size,
+                block_size=args.lm_block_size,
+                n_embd=args.lm_dim,
+                n_head=args.lm_heads,
+                n_layer=args.lm_layers,
+                lr=args.lm_lr,
+                seed=args.seed,
+            )
+            lm_results["bpe"] = bpe_lm
+
+        if do_sp and sp_merges is not None:
+            print("[train] LM on SpectralBPE tokens...", file=sys.stderr)
+            sp_lm = train_and_eval_lm(
+                train_lines,
+                eval_lines,
+                sp_merges,
+                args.pretokenize,
+                args.lowercase,
+                eval_bytes=eval_bytes,
+                epochs=args.lm_epochs,
+                batch_size=args.lm_batch_size,
+                block_size=args.lm_block_size,
+                n_embd=args.lm_dim,
+                n_head=args.lm_heads,
+                n_layer=args.lm_layers,
+                lr=args.lm_lr,
+                seed=args.seed,
+            )
+            lm_results["spectralbpe"] = sp_lm
+
+        if do_uni and sp_model is not None:
+            print("[train] LM on Unigram tokens...", file=sys.stderr)
+            uni_lm = train_and_eval_lm_sp(
+                train_lines,
+                eval_lines,
+                sp_model,
+                args.pretokenize,
+                args.lowercase,
+                eval_bytes=eval_bytes,
+                epochs=args.lm_epochs,
+                batch_size=args.lm_batch_size,
+                block_size=args.lm_block_size,
+                n_embd=args.lm_dim,
+                n_head=args.lm_heads,
+                n_layer=args.lm_layers,
+                lr=args.lm_lr,
+                seed=args.seed,
+            )
+            lm_results["unigram"] = uni_lm
+
+        if lm_results:
+            print_lm_table(lm_results)
+
+    if args.out_json:
+        payload = {
+            "config": vars(args),
+            "metrics": metrics_by_method,
+        }
+        num_merges = {}
+        if bpe_merges is not None:
+            num_merges["bpe"] = len(bpe_merges)
+        if sp_merges is not None:
+            num_merges["spectralbpe"] = len(sp_merges)
+        if num_merges:
+            payload["num_merges"] = num_merges
+        if do_uni and unigram_model_prefix is not None:
+            payload["unigram_model"] = unigram_model_prefix + ".model"
+        if lm_results:
+            lm_payload = {"eval_bytes": lm_eval_bytes}
+            if "bpe" in lm_results:
+                lm_payload.update(
+                    {
+                        "bpe_bpb": lm_results["bpe"][0],
+                        "bpe_avg_seq_len": lm_results["bpe"][1],
+                        "bpe_train_time_sec": lm_results["bpe"][2],
+                    }
+                )
+            if "spectralbpe" in lm_results:
+                lm_payload.update(
+                    {
+                        "spectral_bpb": lm_results["spectralbpe"][0],
+                        "spectral_avg_seq_len": lm_results["spectralbpe"][1],
+                        "spectral_train_time_sec": lm_results["spectralbpe"][2],
+                    }
+                )
+            if "unigram" in lm_results:
+                lm_payload.update(
+                    {
+                        "unigram_bpb": lm_results["unigram"][0],
+                        "unigram_avg_seq_len": lm_results["unigram"][1],
+                        "unigram_train_time_sec": lm_results["unigram"][2],
+                    }
+                )
+            payload["lm"] = lm_payload
+        with open(args.out_json, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"[out] wrote {args.out_json}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
