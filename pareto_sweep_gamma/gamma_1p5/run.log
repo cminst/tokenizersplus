@@ -1,0 +1,311 @@
+[train] BPE...
+[BPE] merges=200/9013
+[BPE] merges=400/9013
+[BPE] merges=600/9013
+[BPE] merges=800/9013
+[checkpoint] wrote pareto_sweep_gamma/gamma_1p5/bpe_merges_001000.json
+[BPE] merges=1000/9013
+[BPE] merges=1200/9013
+[BPE] merges=1400/9013
+[BPE] merges=1600/9013
+[BPE] merges=1800/9013
+[checkpoint] wrote pareto_sweep_gamma/gamma_1p5/bpe_merges_002000.json
+[BPE] merges=2000/9013
+[BPE] merges=2200/9013
+[BPE] merges=2400/9013
+[BPE] merges=2600/9013
+[BPE] merges=2800/9013
+[checkpoint] wrote pareto_sweep_gamma/gamma_1p5/bpe_merges_003000.json
+[BPE] merges=3000/9013
+[BPE] merges=3200/9013
+[BPE] merges=3400/9013
+[BPE] merges=3600/9013
+[BPE] merges=3800/9013
+[checkpoint] wrote pareto_sweep_gamma/gamma_1p5/bpe_merges_004000.json
+[BPE] merges=4000/9013
+[BPE] merges=4200/9013
+[BPE] merges=4400/9013
+[BPE] merges=4600/9013
+[BPE] merges=4800/9013
+[checkpoint] wrote pareto_sweep_gamma/gamma_1p5/bpe_merges_005000.json
+[BPE] merges=5000/9013
+[BPE] merges=5200/9013
+[BPE] merges=5400/9013
+[BPE] merges=5600/9013
+[BPE] merges=5800/9013
+[checkpoint] wrote pareto_sweep_gamma/gamma_1p5/bpe_merges_006000.json
+[BPE] merges=6000/9013
+[BPE] merges=6200/9013
+[BPE] merges=6400/9013
+[BPE] merges=6600/9013
+[BPE] merges=6800/9013
+[checkpoint] wrote pareto_sweep_gamma/gamma_1p5/bpe_merges_007000.json
+[BPE] merges=7000/9013
+[BPE] merges=7200/9013
+[BPE] merges=7400/9013
+[BPE] merges=7600/9013
+[BPE] merges=7800/9013
+[checkpoint] wrote pareto_sweep_gamma/gamma_1p5/bpe_merges_008000.json
+[BPE] merges=8000/9013
+[BPE] merges=8200/9013
+[BPE] merges=8400/9013
+[BPE] merges=8600/9013
+[BPE] merges=8800/9013
+[checkpoint] wrote pareto_sweep_gamma/gamma_1p5/bpe_merges_009000.json
+[BPE] merges=9000/9013
+[checkpoint] wrote pareto_sweep_gamma/gamma_1p5/bpe_final.json
+[train] SpectralBPE...
+[SpectralBPE] warm-start: running 500 BPE merges first
+[SpectralBPE] warm-start complete: 500 merges done
+[SpectralBPE] auto-calibrated sigma = 0.0013 (p90 of |dz| on graph edges)
+[SpectralBPE] outer=1 merges=550/9013 sigma=0.001302 coh: med=0.8684 p10=0.4492 p90=0.9946 |dz|: p50=0.000489 p75=0.0008303 p90=0.001164 (p75/sigma=0.638) z0_frac=0.811 z00_pairs_frac=0.000
+[checkpoint] wrote pareto_sweep_gamma/gamma_1p5/spectralbpe_seed0_merges_001000.json
+[SpectralBPE] outer=10 merges=1000/9013 sigma=0.001302 coh: med=0.6786 p10=0.1236 p90=0.9859 |dz|: p50=0.0008105 p75=0.001361 p90=0.001882 (p75/sigma=1.045) z0_frac=0.774 z00_pairs_frac=0.000
+[SpectralBPE] outer=20 merges=1500/9013 sigma=0.001302 coh: med=0.8460 p10=0.4136 p90=0.9938 |dz|: p50=0.0005322 p75=0.000889 p90=0.001223 (p75/sigma=0.683) z0_frac=0.737 z00_pairs_frac=0.000
+[checkpoint] wrote pareto_sweep_gamma/gamma_1p5/spectralbpe_seed0_merges_002000.json
+[SpectralBPE] outer=30 merges=2000/9013 sigma=0.001302 coh: med=0.9000 p10=0.5737 p90=0.9959 |dz|: p50=0.0004225 p75=0.0007037 p90=0.0009702 (p75/sigma=0.541) z0_frac=0.707 z00_pairs_frac=0.000
+[SpectralBPE] outer=40 merges=2500/9013 sigma=0.001302 coh: med=0.8828 p10=0.5180 p90=0.9952 |dz|: p50=0.0004596 p75=0.0007665 p90=0.001056 (p75/sigma=0.589) z0_frac=0.680 z00_pairs_frac=0.000
+[checkpoint] wrote pareto_sweep_gamma/gamma_1p5/spectralbpe_seed0_merges_003000.json
+[SpectralBPE] outer=50 merges=3000/9013 sigma=0.001302 coh: med=0.8522 p10=0.4268 p90=0.9936 |dz|: p50=0.0005206 p75=0.0008669 p90=0.001201 (p75/sigma=0.666) z0_frac=0.657 z00_pairs_frac=0.000
+[SpectralBPE] outer=60 merges=3500/9013 sigma=0.001302 coh: med=0.7847 p10=0.2758 p90=0.9909 |dz|: p50=0.0006409 p75=0.001066 p90=0.001477 (p75/sigma=0.819) z0_frac=0.638 z00_pairs_frac=0.000
+[checkpoint] wrote pareto_sweep_gamma/gamma_1p5/spectralbpe_seed0_merges_004000.json
+[SpectralBPE] outer=70 merges=4000/9013 sigma=0.001302 coh: med=0.7697 p10=0.2523 p90=0.9903 |dz|: p50=0.0006659 p75=0.001108 p90=0.001527 (p75/sigma=0.852) z0_frac=0.623 z00_pairs_frac=0.000
+[SpectralBPE] outer=80 merges=4500/9013 sigma=0.001302 coh: med=0.8212 p10=0.3570 p90=0.9929 |dz|: p50=0.0005776 p75=0.0009609 p90=0.001321 (p75/sigma=0.738) z0_frac=0.609 z00_pairs_frac=0.000
+[checkpoint] wrote pareto_sweep_gamma/gamma_1p5/spectralbpe_seed0_merges_005000.json
+[SpectralBPE] outer=90 merges=5000/9013 sigma=0.001302 coh: med=0.9122 p10=0.6268 p90=0.9965 |dz|: p50=0.0003945 p75=0.0006495 p90=0.0008895 (p75/sigma=0.499) z0_frac=0.597 z00_pairs_frac=0.000
+[SpectralBPE] outer=100 merges=5500/9013 sigma=0.001302 coh: med=0.8514 p10=0.4399 p90=0.9940 |dz|: p50=0.0005221 p75=0.0008595 p90=0.001179 (p75/sigma=0.660) z0_frac=0.586 z00_pairs_frac=0.000
+[checkpoint] wrote pareto_sweep_gamma/gamma_1p5/spectralbpe_seed0_merges_006000.json
+[SpectralBPE] outer=110 merges=6000/9013 sigma=0.001302 coh: med=0.8152 p10=0.3428 p90=0.9922 |dz|: p50=0.0005882 p75=0.0009753 p90=0.001347 (p75/sigma=0.749) z0_frac=0.578 z00_pairs_frac=0.000
+[SpectralBPE] outer=120 merges=6500/9013 sigma=0.001302 coh: med=0.8466 p10=0.4206 p90=0.9938 |dz|: p50=0.0005312 p75=0.0008824 p90=0.001211 (p75/sigma=0.678) z0_frac=0.570 z00_pairs_frac=0.000
+[checkpoint] wrote pareto_sweep_gamma/gamma_1p5/spectralbpe_seed0_merges_007000.json
+[SpectralBPE] outer=130 merges=7000/9013 sigma=0.001302 coh: med=0.8316 p10=0.3869 p90=0.9931 |dz|: p50=0.0005589 p75=0.0009274 p90=0.001268 (p75/sigma=0.713) z0_frac=0.563 z00_pairs_frac=0.000
+[SpectralBPE] outer=140 merges=7500/9013 sigma=0.001302 coh: med=0.8112 p10=0.3451 p90=0.9924 |dz|: p50=0.0005954 p75=0.0009876 p90=0.001343 (p75/sigma=0.759) z0_frac=0.556 z00_pairs_frac=0.000
+[checkpoint] wrote pareto_sweep_gamma/gamma_1p5/spectralbpe_seed0_merges_008000.json
+[SpectralBPE] outer=150 merges=8000/9013 sigma=0.001302 coh: med=0.8026 p10=0.3326 p90=0.9920 |dz|: p50=0.0006104 p75=0.001006 p90=0.001366 (p75/sigma=0.773) z0_frac=0.551 z00_pairs_frac=0.000
+[SpectralBPE] outer=160 merges=8500/9013 sigma=0.001302 coh: med=0.8398 p10=0.4188 p90=0.9935 |dz|: p50=0.0005438 p75=0.0008956 p90=0.001214 (p75/sigma=0.688) z0_frac=0.546 z00_pairs_frac=0.000
+[checkpoint] wrote pareto_sweep_gamma/gamma_1p5/spectralbpe_seed0_merges_009000.json
+[SpectralBPE] outer=170 merges=9000/9013 sigma=0.001302 coh: med=0.8590 p10=0.4699 p90=0.9945 |dz|: p50=0.0005075 p75=0.0008328 p90=0.001131 (p75/sigma=0.640) z0_frac=0.541 z00_pairs_frac=0.000
+[checkpoint] wrote pareto_sweep_gamma/gamma_1p5/spectralbpe_seed0_final.json
+[train] Unigram (SentencePiece)...
+sentencepiece_trainer.cc(78) LOG(INFO) Starts training with : 
+trainer_spec {
+  input: pareto_sweep_gamma/gamma_1p5/unigram.train.txt
+  input_format: 
+  model_prefix: pareto_sweep_gamma/gamma_1p5/unigram
+  model_type: UNIGRAM
+  vocab_size: 16000
+  self_test_sample_size: 0
+  character_coverage: 1
+  input_sentence_size: 0
+  shuffle_input_sentence: 1
+  seed_sentencepiece_size: 1000000
+  shrinking_factor: 0.75
+  max_sentence_length: 4192
+  num_threads: 16
+  num_sub_iterations: 2
+  max_sentencepiece_length: 16
+  split_by_unicode_script: 1
+  split_by_number: 1
+  split_by_whitespace: 1
+  split_digits: 0
+  pretokenization_delimiter: 
+  treat_whitespace_as_suffix: 0
+  allow_whitespace_only_pieces: 0
+  required_chars: 
+  byte_fallback: 0
+  vocabulary_output_piece_score: 1
+  train_extremely_large_corpus: 0
+  seed_sentencepieces_file: 
+  hard_vocab_limit: 0
+  use_all_vocab: 0
+  unk_id: 0
+  bos_id: 1
+  eos_id: 2
+  pad_id: -1
+  unk_piece: <unk>
+  bos_piece: <s>
+  eos_piece: </s>
+  pad_piece: <pad>
+  unk_surface:  ⁇ 
+  enable_differential_privacy: 0
+  differential_privacy_noise_level: 0
+  differential_privacy_clipping_threshold: 0
+}
+normalizer_spec {
+  name: nmt_nfkc
+  add_dummy_prefix: 1
+  remove_extra_whitespaces: 1
+  escape_whitespaces: 1
+  normalization_rule_tsv: 
+}
+denormalizer_spec {}
+trainer_interface.cc(355) LOG(INFO) SentenceIterator is not specified. Using MultiFileSentenceIterator.
+trainer_interface.cc(186) LOG(INFO) Loading corpus: pareto_sweep_gamma/gamma_1p5/unigram.train.txt
+trainer_interface.cc(382) LOG(WARNING) Found too long line (4217 > 4192).
+trainer_interface.cc(384) LOG(WARNING) Too long lines are skipped in the training.
+trainer_interface.cc(385) LOG(WARNING) The maximum length can be changed with --max_sentence_length=<size> flag.
+trainer_interface.cc(148) LOG(INFO) Loaded 1000000 lines
+trainer_interface.cc(125) LOG(WARNING) Too many sentences are loaded! (1165015), which may slow down training.
+trainer_interface.cc(127) LOG(WARNING) Consider using --input_sentence_size=<size> and --shuffle_input_sentence=true.
+trainer_interface.cc(130) LOG(WARNING) They allow to randomly sample <size> sentences from the entire corpus.
+trainer_interface.cc(411) LOG(INFO) Loaded all 1165015 sentences
+trainer_interface.cc(418) LOG(INFO) Skipped 14 too long sentences.
+trainer_interface.cc(427) LOG(INFO) Adding meta_piece: <unk>
+trainer_interface.cc(427) LOG(INFO) Adding meta_piece: <s>
+trainer_interface.cc(427) LOG(INFO) Adding meta_piece: </s>
+trainer_interface.cc(432) LOG(INFO) Normalizing sentences...
+trainer_interface.cc(541) LOG(INFO) all chars count=535902398
+trainer_interface.cc(552) LOG(INFO) Done: 100% characters are covered.
+trainer_interface.cc(562) LOG(INFO) Alphabet size=4826
+trainer_interface.cc(563) LOG(INFO) Final character coverage=1
+trainer_interface.cc(594) LOG(INFO) Done! preprocessed 1165015 sentences.
+unigram_model_trainer.cc(265) LOG(INFO) Making suffix array...
+unigram_model_trainer.cc(269) LOG(INFO) Extracting frequent sub strings... node_num=271081828
+unigram_model_trainer.cc(312) LOG(INFO) Initialized 944204 seed sentencepieces
+trainer_interface.cc(600) LOG(INFO) Tokenizing input sentences with whitespace: 1165015
+trainer_interface.cc(611) LOG(INFO) Done! 623671
+unigram_model_trainer.cc(602) LOG(INFO) Using 623671 sentences for EM training
+unigram_model_trainer.cc(618) LOG(INFO) EM sub_iter=0 size=389307 obj=10.4477 num_tokens=1253510 num_tokens/piece=3.21985
+unigram_model_trainer.cc(618) LOG(INFO) EM sub_iter=1 size=296750 obj=8.31485 num_tokens=1251169 num_tokens/piece=4.21624
+unigram_model_trainer.cc(618) LOG(INFO) EM sub_iter=0 size=222503 obj=8.24737 num_tokens=1291827 num_tokens/piece=5.80589
+unigram_model_trainer.cc(618) LOG(INFO) EM sub_iter=1 size=222273 obj=8.234 num_tokens=1293343 num_tokens/piece=5.81871
+unigram_model_trainer.cc(618) LOG(INFO) EM sub_iter=0 size=166701 obj=8.24046 num_tokens=1376994 num_tokens/piece=8.26026
+unigram_model_trainer.cc(618) LOG(INFO) EM sub_iter=1 size=166693 obj=8.23736 num_tokens=1378219 num_tokens/piece=8.26801
+unigram_model_trainer.cc(618) LOG(INFO) EM sub_iter=0 size=125018 obj=8.25323 num_tokens=1475278 num_tokens/piece=11.8005
+unigram_model_trainer.cc(618) LOG(INFO) EM sub_iter=1 size=125017 obj=8.24941 num_tokens=1474747 num_tokens/piece=11.7964
+unigram_model_trainer.cc(618) LOG(INFO) EM sub_iter=0 size=93761 obj=8.27686 num_tokens=1576181 num_tokens/piece=16.8106
+unigram_model_trainer.cc(618) LOG(INFO) EM sub_iter=1 size=93761 obj=8.27113 num_tokens=1575461 num_tokens/piece=16.8029
+unigram_model_trainer.cc(618) LOG(INFO) EM sub_iter=0 size=70320 obj=8.31524 num_tokens=1680229 num_tokens/piece=23.894
+unigram_model_trainer.cc(618) LOG(INFO) EM sub_iter=1 size=70320 obj=8.30635 num_tokens=1679505 num_tokens/piece=23.8837
+unigram_model_trainer.cc(618) LOG(INFO) EM sub_iter=0 size=52740 obj=8.37321 num_tokens=1782561 num_tokens/piece=33.799
+unigram_model_trainer.cc(618) LOG(INFO) EM sub_iter=1 size=52740 obj=8.35984 num_tokens=1781843 num_tokens/piece=33.7854
+unigram_model_trainer.cc(618) LOG(INFO) EM sub_iter=0 size=39555 obj=8.45624 num_tokens=1882323 num_tokens/piece=47.5875
+unigram_model_trainer.cc(618) LOG(INFO) EM sub_iter=1 size=39555 obj=8.43718 num_tokens=1881709 num_tokens/piece=47.572
+unigram_model_trainer.cc(618) LOG(INFO) EM sub_iter=0 size=29666 obj=8.57331 num_tokens=1984064 num_tokens/piece=66.8801
+unigram_model_trainer.cc(618) LOG(INFO) EM sub_iter=1 size=29666 obj=8.54661 num_tokens=1983755 num_tokens/piece=66.8696
+unigram_model_trainer.cc(618) LOG(INFO) EM sub_iter=0 size=22249 obj=8.73642 num_tokens=2090061 num_tokens/piece=93.9395
+unigram_model_trainer.cc(618) LOG(INFO) EM sub_iter=1 size=22249 obj=8.6995 num_tokens=2089985 num_tokens/piece=93.9361
+unigram_model_trainer.cc(618) LOG(INFO) EM sub_iter=0 size=17600 obj=8.89949 num_tokens=2182661 num_tokens/piece=124.015
+unigram_model_trainer.cc(618) LOG(INFO) EM sub_iter=1 size=17600 obj=8.86063 num_tokens=2182719 num_tokens/piece=124.018
+trainer_interface.cc(689) LOG(INFO) Saving model: pareto_sweep_gamma/gamma_1p5/unigram.model
+trainer_interface.cc(701) LOG(INFO) Saving vocabs: pareto_sweep_gamma/gamma_1p5/unigram.vocab
+
+[train] LM on BPE tokens...
+[train] LM on SpectralBPE tokens...
+[train] LM on Unigram tokens...
+
+== Intrinsic sanity-check metrics ==
+Metric                                 |          BPE |  SpectralBPE |      Unigram
+-----------------------------------------------------------------------------------
+Bytes per token (↑)                    |     4.174785 |     4.034255 |     4.191059
+Tokens per byte (↓)                    |     0.239533 |     0.247877 |     0.238603
+Fertility (tokens/word) (↓)            |     1.278700 |     1.323242 |     1.273735
+PCW = P(word split) (↓)                |     0.177141 |     0.176893 |     0.182658
+Avg token length (chars) (↑)           |     3.376057 |     3.262413 |     4.174384
+Unique tokens used on eval             |         8019 |         7450 |         9965
+NSL vs BPE (tokens_m/tokens_bpe) (↓)   |     1.000000 |     1.034834 |     0.996117
+-----------------------------------------------------------------------------------
+Totals: bytes=1141787 words=213886 BPE_tokens=273496 SpectralBPE_tokens=283023 Unigram_tokens=272434
+
+== Interpretability ==
+
+Top 20 merges:
+  r | BPE                      | SpectralBPE             
+------------------------------------------------------------
+  0 | ('t', 'h')               | ('t', 'h')              
+  1 | ('th', 'e</w>')          | ('th', 'e</w>')         
+  2 | ('i', 'n')               | ('i', 'n')              
+  3 | ('a', 'n')               | ('a', 'n')              
+  4 | ('e', 'd</w>')           | ('e', 'd</w>')          
+  5 | ('e', 'r')               | ('e', 'r')              
+  6 | ('r', 'e')               | ('r', 'e')              
+  7 | ('a', 'r')               | ('a', 'r')              
+  8 | ('t', 'i')               | ('t', 'i')              
+  9 | ('o', 'n')               | ('o', 'n')              
+ 10 | ('e', 'n')               | ('e', 'n')              
+ 11 | ('e', 'r</w>')           | ('e', 'r</w>')          
+ 12 | ('an', 'd</w>')          | ('an', 'd</w>')         
+ 13 | ('o', 'r')               | ('o', 'r')              
+ 14 | ('o', 'f</w>')           | ('o', 'f</w>')          
+ 15 | ('o', 'n</w>')           | ('o', 'n</w>')          
+ 16 | ('in', 'g</w>')          | ('in', 'g</w>')         
+ 17 | ('i', 'n</w>')           | ('i', 'n</w>')          
+ 18 | ('o', 'u')               | ('o', 'u')              
+ 19 | ('t', 'o</w>')           | ('t', 'o</w>')          
+
+Words with largest |Δtokens| in stored examples:
+  - 'unenthusiastic' (|Δ|=4):
+      BPE        : ['un', 'enthusias', 'tic']
+      SpectralBPE: ['un', 'en', 'th', 'u', 'si', 'as', 'tic']
+  - 'enthusiastically' (|Δ|=4):
+      BPE        : ['enthusias', 'tically']
+      SpectralBPE: ['en', 'th', 'u', 'si', 'as', 'tically']
+  - 'enthusiastic' (|Δ|=4):
+      BPE        : ['enthusias', 'tic']
+      SpectralBPE: ['en', 'th', 'u', 'si', 'as', 'tic']
+  - 'enthusiasm' (|Δ|=4):
+      BPE        : ['enthusias', 'm']
+      SpectralBPE: ['en', 'th', 'u', 'si', 'as', 'm']
+  - 'Sullivan' (|Δ|=4):
+      BPE        : ['Sullivan']
+      SpectralBPE: ['S', 'ul', 'li', 'v', 'an']
+  - 'Caribbean' (|Δ|=4):
+      BPE        : ['Caribbean']
+      SpectralBPE: ['C', 'ari', 'b', 'be', 'an']
+  - 'Arizona' (|Δ|=4):
+      BPE        : ['Arizona']
+      SpectralBPE: ['A', 'ri', 'z', 'on', 'a']
+  - 'utilizing' (|Δ|=3):
+      BPE        : ['utili', 'zing']
+      SpectralBPE: ['u', 'ti', 'li', 'z', 'ing']
+  - 'utilizes' (|Δ|=3):
+      BPE        : ['utili', 'zes']
+      SpectralBPE: ['u', 'ti', 'li', 'z', 'es']
+  - 'utilized' (|Δ|=3):
+      BPE        : ['utili', 'zed']
+      SpectralBPE: ['u', 'ti', 'li', 'z', 'ed']
+  - 'retirement' (|Δ|=3):
+      BPE        : ['retirement']
+      SpectralBPE: ['re', 'ti', 're', 'ment']
+  - 'resettlement' (|Δ|=3):
+      BPE        : ['res', 'et', 't', 'l', 'ement']
+      SpectralBPE: ['re', 'settlement']
+
+High-frequency 'bridge-like' initial pairs (high count, low PPMI, low coherence):
+pair                     |    cnt |    PPMI |    coh |  BPE_r | Spec_r
+----------------------------------------------------------------------
+('h', 'e</w>')           | 6918007 |   2.189 |  0.113 |     29 |     29
+('a', 'n')               | 5193239 |   1.040 |  0.526 |      3 |      3
+('e', 'd</w>')           | 4323669 |   1.530 |  0.022 |      4 |      4
+('t', 'i')               | 3515520 |   0.546 |  0.586 |      8 |      8
+('a', 'r')               | 3276316 |   0.609 |  0.178 |      7 |      7
+('n', 'd</w>')           | 3233582 |   1.712 |  0.001 |   2888 |      -
+('a', 't')               | 2986082 |   0.665 |  0.034 |     24 |     24
+('e', 'n')               | 2972817 |   0.405 |  0.581 |     10 |     10
+('e', 'r</w>')           | 2831852 |   1.727 |  0.423 |     11 |     11
+('o', 'f</w>')           | 2745737 |   2.473 |  0.005 |     14 |     14
+('i', 't')               | 2715410 |   0.646 |  0.586 |     22 |     22
+('n', 'g</w>')           | 2649163 |   2.726 |  0.001 |      - |      -
+('h', 'a')               | 2313568 |   0.665 |  0.081 |     61 |     61
+('e', 'a')               | 2271816 |   0.000 |  0.094 |     47 |     47
+('r', 'a')               | 2196221 |   0.358 |  0.178 |     60 |     60
+
+Early-merge association/coherence (computed on initial graph, over merges present at char-level):
+  format: mean_ppmi, mean_coh, median_ppmi, median_coh
+  BPE        : (0.9042267436613037, 0.5101145198828967, 0.6464645213091029, 0.5809153072513218)
+  SpectralBPE: (0.9042267436613037, 0.5101145198828967, 0.6464645213091029, 0.5809153072513218)
+
+== Vocabulary Quality (Statistical Cohesion) ==
+Metric                       |        BPE |  SpectralBPE
+-------------------------------------------------------
+Avg PPMI of Merges (↑)       |     1.4298 |       1.6971
+(Computed on 572 common atomic pairs)
+
+[RESULT] SpectralBPE merges are 18.7% more statistically cohesive.
+
+== LM generalization (BPB) ==
+Metric                   |          BPE |  SpectralBPE |      Unigram
+---------------------------------------------------------------------
+BPB (eval)               |     1.551572 |     1.551049 |     1.501623
+Avg tokens/sent          |       111.13 |       115.00 |       110.70
+Training time (s)        |       261.21 |       270.78 |       285.34
