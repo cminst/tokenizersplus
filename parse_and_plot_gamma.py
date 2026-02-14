@@ -73,6 +73,7 @@ def main():
     if not rows:
         raise SystemExit(f"No parseable logs found under {ROOT / LOG_GLOB}")
 
+    # ---- CSV ----
     csv_path = ROOT / "pareto.csv"
     fieldnames = list(rows[0].keys())
     with csv_path.open("w", newline="") as f:
@@ -81,23 +82,46 @@ def main():
         w.writerows(rows)
     print(f"[ok] wrote {csv_path}")
 
+    # ---- Plot ----
     xs = [r["ppmi_gain_pct"] for r in rows]
     ys = [r["bpb_delta_pct"] for r in rows]
 
-    plt.figure()
-    plt.scatter(xs, ys)
+    plt.rcParams.update({
+        "font.family": "serif",
+        "mathtext.fontset": "cm",
+        "font.size": 14,
+        "axes.titlesize": 18,
+        "axes.labelsize": 16,
+        "xtick.labelsize": 13,
+        "ytick.labelsize": 13,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+    })
+
+    fig, ax = plt.subplots(figsize=(7.2, 5.0))
+    ax.scatter(xs, ys)
+
     for r in rows:
-        plt.annotate(f'{r["ppmi_gamma"]:.2f}', (r["ppmi_gain_pct"], r["bpb_delta_pct"]),
-                     fontsize=8, xytext=(4,4), textcoords="offset points")
+        ax.annotate(
+            rf"${r['ppmi_gamma']:.2f}$",
+            (r["ppmi_gain_pct"], r["bpb_delta_pct"]),
+            fontsize=12,
+            xytext=(6, 6),
+            textcoords="offset points",
+        )
 
-    plt.axhline(0.0, linewidth=1)
-    plt.xlabel("Cohesion gain (Avg PPMI merges) [%] (higher is better)")
-    plt.ylabel("BPB delta [%] (lower is better)")
-    plt.title("Pareto Sweep over ppmi_gamma (coh_lambda fixed)")
+    ax.axhline(0.0, linewidth=1)
+    ax.grid(True, alpha=0.25)
 
-    out_png = ROOT / "pareto.png"
-    plt.savefig(out_png, dpi=200, bbox_inches="tight")
-    print(f"[ok] wrote {out_png}")
+    ax.set_xlabel(r"Cohesion gain $\Delta_{\mathrm{PPMI}}$ (%) $\uparrow$")
+    ax.set_ylabel(r"BPB change $\Delta_{\mathrm{BPB}}$ (%) $\downarrow$")
+    ax.set_title(r"SpectralBPE Pareto sweep over $\gamma$ (PPMI exponent)")
+
+    fig.tight_layout()
+
+    out_pdf = ROOT / "pareto_gamma.pdf"
+    fig.savefig(out_pdf, bbox_inches="tight")
+    print(f"[ok] wrote {out_pdf}")
 
 if __name__ == "__main__":
     main()
