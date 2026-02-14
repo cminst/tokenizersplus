@@ -106,8 +106,10 @@ def main():
             rf"${r['ppmi_gamma']:.2f}$",
             (r["ppmi_gain_pct"], r["bpb_delta_pct"]),
             fontsize=12,
-            xytext=(6, 6),
+            xytext=(0, 6),
             textcoords="offset points",
+            ha="center",
+            va="bottom",
         )
 
     ax.axhline(0.0, linewidth=1)
