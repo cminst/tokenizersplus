@@ -87,7 +87,7 @@ def main():
     ys = [r["bpb_delta_pct"] for r in rows]
 
     plt.rcParams.update({
-        "font.family": "serif",
+        "font.family": ["Times New Roman", "Times", "serif"],
         "mathtext.fontset": "cm",
         "font.size": 14,
         "axes.titlesize": 18,
@@ -100,15 +100,23 @@ def main():
 
     fig, ax = plt.subplots(figsize=(7.2, 5.0))
     ax.scatter(xs, ys)
+    ax.plot(xs, ys, linestyle="--", linewidth=1.0, color="tab:blue")
 
-    for r in rows:
+    x_min, x_max = min(xs), max(xs)
+    x_span = x_max - x_min if x_max > x_min else 1.0
+    x_left_pad = 0.08 * x_span
+    x_right_trim = -0.05 * x_span
+    ax.set_xlim(x_min - x_left_pad, x_max - x_right_trim)
+
+    for i, r in enumerate(rows):
+        label_offset = (6, 3) if i == 0 else (0, 3)
         ax.annotate(
             rf"${r['ppmi_gamma']:.2f}$",
             (r["ppmi_gain_pct"], r["bpb_delta_pct"]),
             fontsize=12,
-            xytext=(0, 6),
+            xytext=label_offset,
             textcoords="offset points",
-            ha="center",
+            ha="right",
             va="bottom",
         )
 
