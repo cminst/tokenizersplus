@@ -1014,6 +1014,80 @@ def tokens_from_lines_sp(
     return tokens, lengths
 
 
+def corrupt_word_swap(word: str, rng: random.Random) -> str:
+    """Adjacent character swap (typo-like noise). Length-preserving."""
+    if not word or len(word) < 2:
+        return word
+    i = rng.randrange(0, len(word) - 1)
+    return word[:i] + word[i + 1] + word[i] + word[i + 2:]
+
+
+def corrupt_word(word: str, rng: random.Random, prob: float, mode: str) -> str:
+    if prob <= 0.0 or not word:
+        return word
+    if rng.random() >= prob:
+        return word
+    if mode == "swap":
+        return corrupt_word_swap(word, rng)
+    return word  # fallback
+
+
+def tokens_from_lines_noisy(
+    lines: Sequence[str],
+    merges: List[Tuple[str, str]],
+    pre_mode: str,
+    lowercase: bool,
+    noise_prob: float,
+    noise_mode: str,
+    noise_seed: int,
+) -> Tuple[List[str], List[int]]:
+    """Tokenize eval text after applying deterministic word-level noise."""
+    rank = {p: i for i, p in enumerate(merges)}
+    rng = random.Random(noise_seed)
+    tokens: List[str] = []
+    lengths: List[int] = []
+    for line in lines:
+        if lowercase:
+            line = line.lower()
+        line_tokens: List[str] = []
+        for w in pretokenize(line, pre_mode):
+            if not w:
+                continue
+            w2 = corrupt_word(w, rng, prob=noise_prob, mode=noise_mode)
+            line_tokens.extend(encode_word(w2, rank))
+        if line_tokens:
+            lengths.append(len(line_tokens))
+            tokens.extend(line_tokens)
+    return tokens, lengths
+
+
+def tokens_from_lines_sp_noisy(
+    lines: Sequence[str],
+    sp,
+    pre_mode: str,
+    lowercase: bool,
+    noise_prob: float,
+    noise_mode: str,
+    noise_seed: int,
+) -> Tuple[List[str], List[int]]:
+    rng = random.Random(noise_seed)
+    tokens: List[str] = []
+    lengths: List[int] = []
+    for line in lines:
+        if lowercase:
+            line = line.lower()
+        line_tokens: List[str] = []
+        for w in pretokenize(line, pre_mode):
+            if not w:
+                continue
+            w2 = corrupt_word(w, rng, prob=noise_prob, mode=noise_mode)
+            line_tokens.extend(encode_word_sp(sp, w2))
+        if line_tokens:
+            lengths.append(len(line_tokens))
+            tokens.extend(line_tokens)
+    return tokens, lengths
+
+
 def build_vocab(tokens: Sequence[str]) -> Tuple[List[str], Dict[str, int]]:
     uniq = [t for t in sorted(set(tokens)) if t != "<unk>"]
     vocab = ["<unk>"] + uniq
@@ -1097,6 +1171,103 @@ def train_and_eval_lm_sp(
         train_tokens=train_tokens,
         eval_tokens=eval_tokens,
         eval_lengths=eval_lengths,
+        eval_bytes=eval_bytes,
+        epochs=epochs,
+        batch_size=batch_size,
+        block_size=block_size,
+        n_embd=n_embd,
+        n_head=n_head,
+        n_layer=n_layer,
+        lr=lr,
+        seed=seed,
+    )
+
+
+def train_and_eval_lm_robust(
+    train_lines: Sequence[str],
+    eval_lines: Sequence[str],
+    merges: List[Tuple[str, str]],
+    pre_mode: str,
+    lowercase: bool,
+    eval_bytes: int,
+    epochs: int,
+    batch_size: int,
+    block_size: int,
+    n_embd: int,
+    n_head: int,
+    n_layer: int,
+    lr: float,
+    seed: int,
+    noise_prob: float,
+    noise_mode: str,
+    noise_seed: int,
+) -> Tuple[float, float, float, float, float]:
+    """Train LM on clean tokens; evaluate on clean + noisy eval token streams."""
+    train_tokens, _ = tokens_from_lines(train_lines, merges, pre_mode, lowercase)
+    eval_tokens, eval_lengths = tokens_from_lines(eval_lines, merges, pre_mode, lowercase)
+    eval_tokens_noisy, eval_lengths_noisy = tokens_from_lines_noisy(
+        eval_lines,
+        merges,
+        pre_mode,
+        lowercase,
+        noise_prob=noise_prob,
+        noise_mode=noise_mode,
+        noise_seed=noise_seed,
+    )
+    return train_and_eval_lm_from_tokens_robust(
+        train_tokens=train_tokens,
+        eval_tokens=eval_tokens,
+        eval_lengths=eval_lengths,
+        eval_tokens_noisy=eval_tokens_noisy,
+        eval_lengths_noisy=eval_lengths_noisy,
+        eval_bytes=eval_bytes,
+        epochs=epochs,
+        batch_size=batch_size,
+        block_size=block_size,
+        n_embd=n_embd,
+        n_head=n_head,
+        n_layer=n_layer,
+        lr=lr,
+        seed=seed,
+    )
+
+
+def train_and_eval_lm_sp_robust(
+    train_lines: Sequence[str],
+    eval_lines: Sequence[str],
+    sp,
+    pre_mode: str,
+    lowercase: bool,
+    eval_bytes: int,
+    epochs: int,
+    batch_size: int,
+    block_size: int,
+    n_embd: int,
+    n_head: int,
+    n_layer: int,
+    lr: float,
+    seed: int,
+    noise_prob: float,
+    noise_mode: str,
+    noise_seed: int,
+) -> Tuple[float, float, float, float, float]:
+    train_tokens, _ = tokens_from_lines_sp(train_lines, sp, pre_mode, lowercase)
+    eval_tokens, eval_lengths = tokens_from_lines_sp(eval_lines, sp, pre_mode, lowercase)
+    eval_tokens_noisy, eval_lengths_noisy = tokens_from_lines_sp_noisy(
+        eval_lines,
+        sp,
+        pre_mode,
+        lowercase,
+        noise_prob=noise_prob,
+        noise_mode=noise_mode,
+        noise_seed=noise_seed,
+    )
+    return train_and_eval_lm_from_tokens_robust(
+        train_tokens=train_tokens,
+        eval_tokens=eval_tokens,
+        eval_lengths=eval_lengths,
+        eval_tokens_noisy=eval_tokens_noisy,
+        eval_lengths_noisy=eval_lengths_noisy,
         eval_bytes=eval_bytes,
         epochs=epochs,
         batch_size=batch_size,
@@ -1208,6 +1379,121 @@ def train_and_eval_lm_from_tokens(
     return bpb, avg_seq_len, train_time
 
 
+def train_and_eval_lm_from_tokens_robust(
+    train_tokens: Sequence[str],
+    eval_tokens: Sequence[str],
+    eval_lengths: Sequence[int],
+    eval_tokens_noisy: Sequence[str],
+    eval_lengths_noisy: Sequence[int],
+    eval_bytes: int,
+    epochs: int,
+    batch_size: int,
+    block_size: int,
+    n_embd: int,
+    n_head: int,
+    n_layer: int,
+    lr: float,
+    seed: int,
+) -> Tuple[float, float, float, float, float]:
+    """Identical to train_and_eval_lm_from_tokens, but evaluates the same trained model on a noisy eval stream."""
+    try:
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+    except Exception as e:
+        raise RuntimeError("Torch is required for --train_lm. Install: pip install torch") from e
+
+    avg_seq_len = (sum(eval_lengths) / len(eval_lengths)) if eval_lengths else 0.0
+    avg_seq_len_noisy = (sum(eval_lengths_noisy) / len(eval_lengths_noisy)) if eval_lengths_noisy else 0.0
+
+    if len(train_tokens) < block_size + 1:
+        raise RuntimeError("Not enough training tokens for the requested --lm_block_size.")
+
+    vocab, stoi = build_vocab(train_tokens)
+    unk_id = stoi["<unk>"]
+    train_ids = np.array([stoi.get(t, unk_id) for t in train_tokens], dtype=np.int64)
+    eval_ids = np.array([stoi.get(t, unk_id) for t in eval_tokens], dtype=np.int64)
+    eval_ids_noisy = np.array([stoi.get(t, unk_id) for t in eval_tokens_noisy], dtype=np.int64)
+
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    torch.manual_seed(seed)
+    random.seed(seed)
+
+    class MiniTransformerLM(nn.Module):
+        def __init__(self, vocab_size: int):
+            super().__init__()
+            self.token_emb = nn.Embedding(vocab_size, n_embd)
+            self.pos_emb = nn.Embedding(block_size, n_embd)
+            enc_layer = nn.TransformerEncoderLayer(
+                d_model=n_embd,
+                nhead=n_head,
+                dim_feedforward=4 * n_embd,
+                dropout=0.1,
+                batch_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layer)
+            self.ln = nn.LayerNorm(n_embd)
+            self.head = nn.Linear(n_embd, vocab_size, bias=False)
+
+        def forward(self, idx):
+            bsz, t = idx.shape
+            pos = torch.arange(t, device=idx.device).unsqueeze(0)
+            x = self.token_emb(idx) + self.pos_emb(pos)
+            mask = torch.triu(torch.ones(t, t, device=idx.device), diagonal=1).bool()
+            x = self.encoder(x, mask)
+            x = self.ln(x)
+            return self.head(x)
+
+    def eval_total_loss(model: nn.Module, ids: np.ndarray, eval_block_size: int) -> float:
+        if eval_block_size <= 0:
+            return float("nan")
+        total = 0.0
+        model.eval()
+        with torch.no_grad():
+            for x_np, y_np in iter_lm_batches(ids, eval_block_size, batch_size, None):
+                x = torch.from_numpy(x_np).to(device)
+                y = torch.from_numpy(y_np).to(device)
+                logits = model(x)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), reduction="sum")
+                total += float(loss.item())
+        return total
+
+    model = MiniTransformerLM(len(vocab)).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+
+    # ---- Train ----
+    model.train()
+    t0 = time.perf_counter()
+    for epoch in range(epochs):
+        rng = random.Random(seed + epoch)
+        for x_np, y_np in iter_lm_batches(train_ids, block_size, batch_size, rng):
+            x = torch.from_numpy(x_np).to(device)
+            y = torch.from_numpy(y_np).to(device)
+            logits = model(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+    train_time = time.perf_counter() - t0
+
+    # ---- Eval (clean) ----
+    eval_block_size = min(block_size, len(eval_ids) - 1) if len(eval_ids) > 1 else 0
+    total_loss = eval_total_loss(model, eval_ids, eval_block_size)
+
+    # ---- Eval (noisy) ----
+    eval_block_size_noisy = min(block_size, len(eval_ids_noisy) - 1) if len(eval_ids_noisy) > 1 else 0
+    total_loss_noisy = eval_total_loss(model, eval_ids_noisy, eval_block_size_noisy)
+
+    if eval_bytes <= 0:
+        bpb = float("nan")
+        bpb_noisy = float("nan")
+    else:
+        bpb = (total_loss / float(eval_bytes)) / math.log(2.0)
+        bpb_noisy = (total_loss_noisy / float(eval_bytes)) / math.log(2.0)
+
+    return bpb, bpb_noisy, avg_seq_len, avg_seq_len_noisy, train_time
+
+
 def print_lm_table(lm_by_method: Dict[str, Tuple[float, float, float]]) -> None:
     methods = [m for m in ALLOWED_METHODS if m in lm_by_method]
     if not methods:
@@ -1226,6 +1512,43 @@ def print_lm_table(lm_by_method: Dict[str, Tuple[float, float, float]]) -> None:
     row("BPB (eval)", 0, "{:.6f}")
     row("Avg tokens/sent", 1, "{:.2f}")
     row("Training time (s)", 2, "{:.2f}")
+
+
+def print_lm_robust_table(
+    lm_clean: Dict[str, Tuple[float, float, float]],
+    lm_noisy: Dict[str, Tuple[float, float, float]],
+) -> None:
+    """Print robustness metrics: noisy BPB and degradation relative to clean."""
+    methods = [m for m in ALLOWED_METHODS if (m in lm_clean and m in lm_noisy)]
+    if not methods:
+        print("\n== LM robustness (noisy eval) ==\n(no methods selected)")
+        return
+
+    print("\n== LM robustness (noisy eval) ==")
+    header = f"{'Metric':24s} | " + " | ".join(f"{METHOD_LABELS[m]:>12s}" for m in methods)
+    print(header)
+    print("-" * max(56, len(header)))
+
+    def row_vals(name: str, vals: List[str]):
+        print(f"{name:24s} | " + " | ".join(f"{v:>12s}" for v in vals))
+
+    bpb_noisy_vals = [f"{lm_noisy[m][0]:.6f}" for m in methods]
+    row_vals("BPB (eval noisy)", bpb_noisy_vals)
+
+    deg_vals = []
+    for m in methods:
+        clean = lm_clean[m][0]
+        noisy = lm_noisy[m][0]
+        if not (math.isfinite(clean) and math.isfinite(noisy)) or clean <= 0:
+            deg_vals.append("nan")
+        else:
+            deg_vals.append(f"{100.0 * (noisy / clean - 1.0):.2f}")
+    row_vals("ΔBPB noisy-clean (%)", deg_vals)
+
+    toks_noisy_vals = [f"{lm_noisy[m][1]:.2f}" for m in methods]
+    row_vals("Avg tokens/sent (noisy)", toks_noisy_vals)
+
+    print("-" * max(56, len(header)))
 
 
 # ---------- Main ----------
@@ -1298,6 +1621,14 @@ def main():
     ap.add_argument("--lm_heads", type=int, default=4)
     ap.add_argument("--lm_layers", type=int, default=2)
     ap.add_argument("--lm_lr", type=float, default=3e-4)
+    ap.add_argument("--lm_robust_eval", action="store_true",
+                    help="Also evaluate the trained LM on a noisy version of eval text (robustness)")
+    ap.add_argument("--lm_noise_mode", choices=["swap"], default="swap",
+                    help="Noise type for robust eval (default: swap = adjacent character swap within a word)")
+    ap.add_argument("--lm_noise_prob", type=float, default=0.10,
+                    help="Probability of corrupting each pre-tokenized word in robust eval (default: 0.10)")
+    ap.add_argument("--lm_noise_seed", type=int, default=None,
+                    help="Seed for noise generation (default: seed+12345)")
 
     ap.add_argument("--out_json", type=str, default=None)
     args = ap.parse_args()
@@ -1498,7 +1829,9 @@ def main():
         interpretability(bpe_merges, sp_merges, ex_b, ex_s, debug, sigma=sigma_val)
 
     lm_results: Dict[str, Tuple[float, float, float]] = {}
+    lm_noisy_results: Dict[str, Tuple[float, float, float]] = {}
     lm_eval_bytes = None
+    lm_noise_cfg: Optional[Dict[str, Any]] = None
     if args.train_lm:
         if args.max_eval_lines is None:
             try:
@@ -1509,68 +1842,143 @@ def main():
             eval_bytes = sum(len((line + "\n").encode("utf-8", errors="ignore")) for line in eval_lines)
         lm_eval_bytes = eval_bytes
 
+        noise_seed = args.lm_noise_seed if args.lm_noise_seed is not None else (args.seed + 12345)
+        if args.lm_robust_eval:
+            lm_noise_cfg = {"mode": args.lm_noise_mode, "prob": float(args.lm_noise_prob), "seed": int(noise_seed)}
+
         if do_bpe and bpe_merges is not None:
             print("\n[train] LM on BPE tokens...", file=sys.stderr)
-            bpe_lm = train_and_eval_lm(
-                train_lines,
-                eval_lines,
-                bpe_merges,
-                args.pretokenize,
-                args.lowercase,
-                eval_bytes=eval_bytes,
-                epochs=args.lm_epochs,
-                batch_size=args.lm_batch_size,
-                block_size=args.lm_block_size,
-                n_embd=args.lm_dim,
-                n_head=args.lm_heads,
-                n_layer=args.lm_layers,
-                lr=args.lm_lr,
-                seed=args.seed,
-            )
-            lm_results["bpe"] = bpe_lm
+            if args.lm_robust_eval:
+                bpb, bpb_noisy, asl, asl_noisy, tsec = train_and_eval_lm_robust(
+                    train_lines,
+                    eval_lines,
+                    bpe_merges,
+                    args.pretokenize,
+                    args.lowercase,
+                    eval_bytes=eval_bytes,
+                    epochs=args.lm_epochs,
+                    batch_size=args.lm_batch_size,
+                    block_size=args.lm_block_size,
+                    n_embd=args.lm_dim,
+                    n_head=args.lm_heads,
+                    n_layer=args.lm_layers,
+                    lr=args.lm_lr,
+                    seed=args.seed,
+                    noise_prob=args.lm_noise_prob,
+                    noise_mode=args.lm_noise_mode,
+                    noise_seed=noise_seed,
+                )
+                lm_results["bpe"] = (bpb, asl, tsec)
+                lm_noisy_results["bpe"] = (bpb_noisy, asl_noisy, tsec)
+            else:
+                bpe_lm = train_and_eval_lm(
+                    train_lines,
+                    eval_lines,
+                    bpe_merges,
+                    args.pretokenize,
+                    args.lowercase,
+                    eval_bytes=eval_bytes,
+                    epochs=args.lm_epochs,
+                    batch_size=args.lm_batch_size,
+                    block_size=args.lm_block_size,
+                    n_embd=args.lm_dim,
+                    n_head=args.lm_heads,
+                    n_layer=args.lm_layers,
+                    lr=args.lm_lr,
+                    seed=args.seed,
+                )
+                lm_results["bpe"] = bpe_lm
 
         if do_sp and sp_merges is not None:
             print("[train] LM on SpectralBPE tokens...", file=sys.stderr)
-            sp_lm = train_and_eval_lm(
-                train_lines,
-                eval_lines,
-                sp_merges,
-                args.pretokenize,
-                args.lowercase,
-                eval_bytes=eval_bytes,
-                epochs=args.lm_epochs,
-                batch_size=args.lm_batch_size,
-                block_size=args.lm_block_size,
-                n_embd=args.lm_dim,
-                n_head=args.lm_heads,
-                n_layer=args.lm_layers,
-                lr=args.lm_lr,
-                seed=args.seed,
-            )
-            lm_results["spectralbpe"] = sp_lm
+            if args.lm_robust_eval:
+                bpb, bpb_noisy, asl, asl_noisy, tsec = train_and_eval_lm_robust(
+                    train_lines,
+                    eval_lines,
+                    sp_merges,
+                    args.pretokenize,
+                    args.lowercase,
+                    eval_bytes=eval_bytes,
+                    epochs=args.lm_epochs,
+                    batch_size=args.lm_batch_size,
+                    block_size=args.lm_block_size,
+                    n_embd=args.lm_dim,
+                    n_head=args.lm_heads,
+                    n_layer=args.lm_layers,
+                    lr=args.lm_lr,
+                    seed=args.seed,
+                    noise_prob=args.lm_noise_prob,
+                    noise_mode=args.lm_noise_mode,
+                    noise_seed=noise_seed,
+                )
+                lm_results["spectralbpe"] = (bpb, asl, tsec)
+                lm_noisy_results["spectralbpe"] = (bpb_noisy, asl_noisy, tsec)
+            else:
+                sp_lm = train_and_eval_lm(
+                    train_lines,
+                    eval_lines,
+                    sp_merges,
+                    args.pretokenize,
+                    args.lowercase,
+                    eval_bytes=eval_bytes,
+                    epochs=args.lm_epochs,
+                    batch_size=args.lm_batch_size,
+                    block_size=args.lm_block_size,
+                    n_embd=args.lm_dim,
+                    n_head=args.lm_heads,
+                    n_layer=args.lm_layers,
+                    lr=args.lm_lr,
+                    seed=args.seed,
+                )
+                lm_results["spectralbpe"] = sp_lm
 
         if do_uni and sp_model is not None:
             print("[train] LM on Unigram tokens...", file=sys.stderr)
-            uni_lm = train_and_eval_lm_sp(
-                train_lines,
-                eval_lines,
-                sp_model,
-                args.pretokenize,
-                args.lowercase,
-                eval_bytes=eval_bytes,
-                epochs=args.lm_epochs,
-                batch_size=args.lm_batch_size,
-                block_size=args.lm_block_size,
-                n_embd=args.lm_dim,
-                n_head=args.lm_heads,
-                n_layer=args.lm_layers,
-                lr=args.lm_lr,
-                seed=args.seed,
-            )
-            lm_results["unigram"] = uni_lm
+            if args.lm_robust_eval:
+                bpb, bpb_noisy, asl, asl_noisy, tsec = train_and_eval_lm_sp_robust(
+                    train_lines,
+                    eval_lines,
+                    sp_model,
+                    args.pretokenize,
+                    args.lowercase,
+                    eval_bytes=eval_bytes,
+                    epochs=args.lm_epochs,
+                    batch_size=args.lm_batch_size,
+                    block_size=args.lm_block_size,
+                    n_embd=args.lm_dim,
+                    n_head=args.lm_heads,
+                    n_layer=args.lm_layers,
+                    lr=args.lm_lr,
+                    seed=args.seed,
+                    noise_prob=args.lm_noise_prob,
+                    noise_mode=args.lm_noise_mode,
+                    noise_seed=noise_seed,
+                )
+                lm_results["unigram"] = (bpb, asl, tsec)
+                lm_noisy_results["unigram"] = (bpb_noisy, asl_noisy, tsec)
+            else:
+                uni_lm = train_and_eval_lm_sp(
+                    train_lines,
+                    eval_lines,
+                    sp_model,
+                    args.pretokenize,
+                    args.lowercase,
+                    eval_bytes=eval_bytes,
+                    epochs=args.lm_epochs,
+                    batch_size=args.lm_batch_size,
+                    block_size=args.lm_block_size,
+                    n_embd=args.lm_dim,
+                    n_head=args.lm_heads,
+                    n_layer=args.lm_layers,
+                    lr=args.lm_lr,
+                    seed=args.seed,
+                )
+                lm_results["unigram"] = uni_lm
 
         if lm_results:
             print_lm_table(lm_results)
+            if args.lm_robust_eval and lm_noisy_results:
+                print_lm_robust_table(lm_results, lm_noisy_results)
 
     if args.out_json:
         payload = {
@@ -1588,6 +1996,18 @@ def main():
             payload["unigram_model"] = unigram_model_prefix + ".model"
         if lm_results:
             lm_payload = {"eval_bytes": lm_eval_bytes}
+            if lm_noise_cfg is not None:
+                lm_payload["noise"] = lm_noise_cfg
+            if lm_noisy_results:
+                if "bpe" in lm_noisy_results:
+                    lm_payload["bpe_bpb_noisy"] = lm_noisy_results["bpe"][0]
+                    lm_payload["bpe_avg_seq_len_noisy"] = lm_noisy_results["bpe"][1]
+                if "spectralbpe" in lm_noisy_results:
+                    lm_payload["spectral_bpb_noisy"] = lm_noisy_results["spectralbpe"][0]
+                    lm_payload["spectral_avg_seq_len_noisy"] = lm_noisy_results["spectralbpe"][1]
+                if "unigram" in lm_noisy_results:
+                    lm_payload["unigram_bpb_noisy"] = lm_noisy_results["unigram"][0]
+                    lm_payload["unigram_avg_seq_len_noisy"] = lm_noisy_results["unigram"][1]
             if "bpe" in lm_results:
                 lm_payload.update(
                     {

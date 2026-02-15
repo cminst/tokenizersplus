@@ -59,7 +59,8 @@ run_one () {
     echo "  --bpe_warmstart $BPE_WARMSTART \\"
     echo "  --seed $SEED --deterministic_ties \\"
     echo "  --checkpoint_dir $outdir --checkpoint_every $CHECKPOINT_EVERY \\"
-    echo "  --train_lm"
+    echo "  --train_lm \\"
+    echo "  --lm_robust_eval --lm_noise_mode swap --lm_noise_prob 0.10"
   } > "$cmdfile"
 
   echo "[run] gamma=$gamma -> $outdir"
@@ -77,6 +78,7 @@ run_one () {
     --seed "$SEED" --deterministic_ties \
     --checkpoint_dir "$outdir" --checkpoint_every "$CHECKPOINT_EVERY" \
     --train_lm \
+    --lm_robust_eval --lm_noise_mode swap --lm_noise_prob 0.10 \
     >"$logfile" 2>&1
 }
 

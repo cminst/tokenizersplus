@@ -2,11 +2,14 @@ import re
 import csv
 from pathlib import Path
 import matplotlib.pyplot as plt
+import math
+import numpy as np
 
 ROOT = Path("pareto_sweep_gamma")
 LOG_GLOB = "gamma_*/run.log"
 
 RE_BPB  = re.compile(r"^BPB \(eval\)\s*\|\s*([0-9.]+)\s*\|\s*([0-9.]+)\s*\|")
+RE_BPB_NOISY  = re.compile(r"^BPB \(eval noisy\)\s*\|\s*([0-9.]+)\s*\|\s*([0-9.]+)\s*\|")
 RE_TOKS = re.compile(r"^Avg tokens/sent\s*\|\s*([0-9.]+)\s*\|\s*([0-9.]+)\s*\|")
 RE_PPMI = re.compile(r"^Avg PPMI of Merges.*\|\s*([0-9.]+)\s*\|\s*([0-9.]+)\s*$")
 
@@ -17,6 +20,7 @@ def parse_one(log_path: Path):
     gamma = float(m.group(1).replace("p", "."))
 
     bpe_bpb = spec_bpb = None
+    bpe_bpb_noisy = spec_bpb_noisy = None
     bpe_tok = spec_tok = None
     bpe_ppmi = spec_ppmi = None
 
@@ -27,6 +31,12 @@ def parse_one(log_path: Path):
         if m:
             bpe_bpb = float(m.group(1))
             spec_bpb = float(m.group(2))
+            continue
+
+        m = RE_BPB_NOISY.match(line)
+        if m:
+            bpe_bpb_noisy = float(m.group(1))
+            spec_bpb_noisy = float(m.group(2))
             continue
 
         m = RE_TOKS.match(line)
@@ -55,6 +65,14 @@ def parse_one(log_path: Path):
         "bpe_ppmi": bpe_ppmi,
         "spec_ppmi": spec_ppmi,
         "ppmi_gain_pct": 100.0 * (spec_ppmi / bpe_ppmi - 1.0),
+        "bpe_bpb_noisy": (bpe_bpb_noisy if bpe_bpb_noisy is not None else float("nan")),
+        "spec_bpb_noisy": (spec_bpb_noisy if spec_bpb_noisy is not None else float("nan")),
+        "bpe_noise_increase_pct": (100.0 * (bpe_bpb_noisy / bpe_bpb - 1.0) if (bpe_bpb_noisy is not None and bpe_bpb) else float("nan")),
+        "spec_noise_increase_pct": (100.0 * (spec_bpb_noisy / spec_bpb - 1.0) if (spec_bpb_noisy is not None and spec_bpb) else float("nan")),
+        "robust_delta_pct": (
+            (100.0 * (spec_bpb_noisy / spec_bpb - 1.0) if (spec_bpb_noisy is not None and spec_bpb) else float("nan"))
+            - (100.0 * (bpe_bpb_noisy / bpe_bpb - 1.0) if (bpe_bpb_noisy is not None and bpe_bpb) else float("nan"))
+        ),
         "log_path": str(log_path),
     }
 
@@ -74,7 +92,7 @@ def main():
 
     # ---- CSV ----
     csv_path = ROOT / "pareto.csv"
-    fieldnames = list(rows[0].keys())
+    fieldnames = sorted({k for r in rows for k in r.keys()})
     with csv_path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
@@ -131,6 +149,41 @@ def main():
     out_pdf = ROOT / "pareto_gamma.pdf"
     fig.savefig(out_pdf, bbox_inches="tight")
     print(f"[ok] wrote {out_pdf}")
+
+    # ---- Robustness Plot (optional; requires --lm_robust_eval logs) ----
+    rrows = [r for r in rows if math.isfinite(r.get("robust_delta_pct", float("nan")))]
+    if rrows:
+        xs_r = [r["ppmi_gain_pct"] for r in rrows]
+        ys_r = [r["robust_delta_pct"] for r in rrows]
+
+        fig2, ax2 = plt.subplots(figsize=(7.2, 5.0))
+        ax2.scatter(xs_r, ys_r)
+        ax2.plot(xs_r, ys_r, linestyle="--", linewidth=1.0, color="tab:orange")
+        ax2.axhline(0.0, linewidth=1)
+        ax2.grid(True, alpha=0.25)
+
+        ax2.set_xlabel(r"Cohesion gain $\Delta_{\mathrm{PPMI}}$ (%) $\uparrow$")
+        ax2.set_ylabel(r"Robustness delta $\Delta_{\mathrm{rob}}$ (%) (more negative is better)")
+        ax2.set_title(r"Robustness under word-level swap noise (p=0.10)")
+
+        for i, r in enumerate(rrows):
+            ax2.annotate(
+                rf"${r['ppmi_gamma']:.2f}$",
+                (r["ppmi_gain_pct"], r["robust_delta_pct"]),
+                fontsize=12,
+                xytext=(0, 3),
+                textcoords="offset points",
+                ha="right",
+                va="bottom",
+            )
+
+        fig2.tight_layout()
+        out_pdf2 = ROOT / "robust_gamma.pdf"
+        fig2.savefig(out_pdf2, bbox_inches="tight")
+        print(f"[ok] wrote {out_pdf2}")
+
+        corr = float(np.corrcoef(np.array(xs_r), np.array(ys_r))[0, 1]) if len(xs_r) >= 2 else float("nan")
+        print(f"[robust] corr(ppmi_gain_pct, robust_delta_pct) = {corr:.4f}")
 
 if __name__ == "__main__":
     main()
