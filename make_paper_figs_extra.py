@@ -122,31 +122,29 @@ def main():
         ("unique_tokens_used", "Unique toks ↑"),
     ]
 
-    def pct_delta(m, base):
+    def pct_of_base(m, base):
         out=[]
         for k,_ in metrics:
-            out.append(100.0 * (m[k] / base[k] - 1.0))
+            out.append(100.0 * (m[k] / base[k]))
         return np.array(out)
 
-    # Increase BatchedBPE bars by 1.5x for visual emphasis, then de-emphasize both
-    # methods slightly with a wider y-axis in the final view.
-    d_bat = 1.5 * pct_delta(mx, mb)
-    d_sp  = pct_delta(ms, mb)
+    p_bat = pct_of_base(mx, mb)
+    p_sp  = pct_of_base(ms, mb)
 
     labels = [lab for _,lab in metrics]
     x = np.arange(len(labels))
     w = 0.36
 
     fig2, ax2 = plt.subplots(figsize=(8.4, 4.8))
-    ax2.bar(x - w/2, d_bat, width=w, label="BatchedBPE (Δ% vs BPE)")
-    ax2.bar(x + w/2, d_sp,  width=w, label="SpectralBPE (knee) (Δ% vs BPE)")
-    ax2.axhline(0.0, linewidth=1)
+    ax2.bar(x - w/2, p_bat, width=w, label="BatchedBPE (% of BPE)")
+    ax2.bar(x + w/2, p_sp,  width=w, label="SpectralBPE (knee) (% of BPE)")
+    ax2.axhline(100.0, linewidth=1)
     ax2.grid(True, axis="y", alpha=0.25)
     ax2.set_xticks(x)
     ax2.set_xticklabels(labels, rotation=20, ha="right")
-    ax2.set_ylabel("Percent change vs BPE (%)")
-    ax2.set_title("Intrinsic metric changes vs BPE")
-    yvals = np.concatenate([d_bat, d_sp])
+    ax2.set_ylabel("Percent of BPE (%)")
+    ax2.set_title("Intrinsic metric values relative to BPE")
+    yvals = np.concatenate([p_bat, p_sp])
     ypad = 0.3 * max(np.max(np.abs(yvals)), 1.0)
     ax2.set_ylim(np.min(yvals) - ypad, np.max(yvals) + ypad)
     ax2.legend(loc="best", frameon=True)
