@@ -6,9 +6,12 @@ import matplotlib.pyplot as plt
 ROOT = Path("pareto_sweep_lambda")
 LOG_GLOB = "lambda_*/run.log"
 
-RE_BPB  = re.compile(r"^BPB \(eval\)\s*\|\s*([0-9.]+)\s*\|\s*([0-9.]+)\s*\|")
-RE_TOKS = re.compile(r"^Avg tokens/sent\s*\|\s*([0-9.]+)\s*\|\s*([0-9.]+)\s*\|")
-RE_PPMI = re.compile(r"^Avg PPMI of Merges.*\|\s*([0-9.]+)\s*\|\s*([0-9.]+)\s*$")
+NUM = r"([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)"
+
+RE_BPB  = re.compile(rf"^BPB \(eval\)\s*\|\s*{NUM}\s*\|\s*{NUM}\s*$")
+RE_TOKS = re.compile(rf"^Avg tokens/sent\s*\|\s*{NUM}\s*\|\s*{NUM}\s*$")
+RE_PPMI = re.compile(rf"^Avg PPMI of Merges.*\|\s*{NUM}\s*\|\s*{NUM}(?:\s*\|.*)?\s*$")
+
 
 def parse_one(log_path: Path):
     m = re.search(r"lambda_(\d+p\d+)", str(log_path.parent))
