@@ -145,7 +145,7 @@ def main():
     ax2.set_xticks(x)
     ax2.set_xticklabels(labels, rotation=20, ha="right")
     ax2.set_ylabel("Percent change vs BPE (%)")
-    ax2.set_title("Intrinsic metric changes vs. BPE")
+    ax2.set_title("Intrinsic metric changes vs BPE")
     yvals = np.concatenate([d_bat, d_sp])
     ypad = 0.3 * max(np.max(np.abs(yvals)), 1.0)
     ax2.set_ylim(np.min(yvals) - ypad, np.max(yvals) + ypad)
