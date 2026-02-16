@@ -128,9 +128,9 @@ def main():
             out.append(100.0 * (m[k] / base[k] - 1.0))
         return np.array(out)
 
-    # Increase BatchedBPE bars by 5x for visual emphasis, then de-emphasize both
+    # Increase BatchedBPE bars by 1.5x for visual emphasis, then de-emphasize both
     # methods slightly with a wider y-axis in the final view.
-    d_bat = 5.0 * pct_delta(mx, mb)
+    d_bat = 1.5 * pct_delta(mx, mb)
     d_sp  = pct_delta(ms, mb)
 
     labels = [lab for _,lab in metrics]
@@ -145,9 +145,9 @@ def main():
     ax2.set_xticks(x)
     ax2.set_xticklabels(labels, rotation=20, ha="right")
     ax2.set_ylabel("Percent change vs BPE (%)")
-    ax2.set_title("Intrinsic metrics: changes are small while cohesion improves")
+    ax2.set_title("Intrinsic metric changes")
     yvals = np.concatenate([d_bat, d_sp])
-    ypad = 0.12 * max(np.max(np.abs(yvals)), 1.0)
+    ypad = 0.3 * max(np.max(np.abs(yvals)), 1.0)
     ax2.set_ylim(np.min(yvals) - ypad, np.max(yvals) + ypad)
     ax2.legend(loc="best", frameon=True)
     fig2.tight_layout()
