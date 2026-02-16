@@ -94,7 +94,7 @@ def main():
     ]:
         vals = atomic_ppmi_list(merges)
         xs, ys = ecdf(vals)
-        ax.plot(xs, ys, linewidth=2, label=f"{name} (n={len(xs)})")
+        ax.plot(xs, ys, linewidth=2, label=name)
 
     ax.grid(True, alpha=0.25)
     ax.set_xlabel(r"Atomic merge PPMI")
