@@ -116,8 +116,8 @@ def main():
     })
 
     fig, ax = plt.subplots(figsize=(7.2, 5.0))
-    ax.scatter(xs, ys)
-    ax.plot(xs, ys, linestyle="--", linewidth=1.0, color="tab:blue")
+    ax.scatter(xs, ys, color="C2")
+    ax.plot(xs, ys, linestyle="--", linewidth=1.0, color="C2")
 
     x_min, x_max = min(xs), max(xs)
     x_span = x_max - x_min if x_max > x_min else 1.0
@@ -157,8 +157,8 @@ def main():
         ys_r = [r["robust_delta_pct"] for r in rrows]
 
         fig2, ax2 = plt.subplots(figsize=(7.2, 5.0))
-        ax2.scatter(xs_r, ys_r)
-        ax2.plot(xs_r, ys_r, linestyle="--", linewidth=1.0, color="tab:orange")
+        ax2.scatter(xs_r, ys_r, color="C2")
+        ax2.plot(xs_r, ys_r, linestyle="--", linewidth=1.0, color="C2")
         ax2.axhline(0.0, linewidth=1)
         ax2.grid(True, alpha=0.25)
 
