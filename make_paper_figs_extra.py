@@ -136,8 +136,8 @@ def main():
     w = 0.36
 
     fig2, ax2 = plt.subplots(figsize=(8.4, 4.8))
-    ax2.bar(x - w/2, p_bat, width=w, label="BatchedBPE (% of BPE)")
-    ax2.bar(x + w/2, p_sp,  width=w, label="SpectralBPE (knee) (% of BPE)")
+    ax2.bar(x - w/2, p_bat, width=w, color="C1", label="BatchedBPE (% of BPE)")
+    ax2.bar(x + w/2, p_sp,  width=w, color="C2", label="SpectralBPE (knee) (% of BPE)")
     ax2.axhline(100.0, linewidth=1)
     ax2.grid(True, axis="y", alpha=0.25)
     ax2.set_xticks(x)
