@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Stratify tokens-per-word by word frequency bins for two tokenizers.
 Outputs a table and (optionally) a bar chart.

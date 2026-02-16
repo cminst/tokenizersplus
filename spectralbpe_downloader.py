@@ -1,6 +1,3 @@
-# download_wikitext_to_txt.py
-# pip install datasets
-
 import argparse
 from pathlib import Path
 from datasets import load_dataset

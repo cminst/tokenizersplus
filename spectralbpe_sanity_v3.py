@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-# Sanity-check: compare standard frequency-BPE vs SpectralBPE on intrinsic tokenizer metrics
+# Compare standard frequency-BPE vs SpectralBPE on intrinsic tokenizer metrics
 # (bytes/token, fertility, PCW, NSL vs BPE) + a small interpretability dump.
 # Optional: train a tiny LM for a generalization test (requires torch).
 #

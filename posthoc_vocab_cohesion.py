@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Post-hoc *exact* replication of SpectralBPE's in-run cohesion metric, with an added Unigram column.
 
 This script reproduces the numbers printed by spectralbpe_sanity_v3.py:
