@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import argparse
 import json
 import random
@@ -137,7 +136,7 @@ def main():
 
     args = ap.parse_args()
 
-    # Import your tokenizer code
+    # Import tokenizer code
     spec = importlib.util.spec_from_file_location("sb", args.spectral_script)
     sb = importlib.util.module_from_spec(spec)
     assert spec.loader is not None

@@ -43,7 +43,6 @@ def main():
     ap.add_argument("--outdir", default="figs")
     args = ap.parse_args()
 
-    # import your implementation as a module
     spec = importlib.util.spec_from_file_location("sb", args.script)
     sb = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(sb)
