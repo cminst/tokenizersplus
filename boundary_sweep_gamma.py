@@ -73,17 +73,18 @@ def write_latex_table(rows: List[Dict], out_path: Path, caption: str, label: str
     lines.append(rf"\label{{{latex_escape(label)}}}")
     lines.append(r"\begin{tabular}{ccccc}")
     lines.append(r"\toprule")
-    lines.append(r"$\gamma$ & BPE (\%) & SpectralBPE (\%) & $\Delta$ (\%) & Hits (Spec/BPE) \\")
+    lines.append(r"\textbf{Model / $\gamma$} & BPE (\%) & SpectralBPE (\%) & $\Delta$ (\%) & Hits (Spec/BPE) \\")
     lines.append(r"\midrule")
+    bpe_pct = 100.0 * rows[0]["bpe_rate"]
+    bpe_hits = rows[0]["bpe_hits"]
+    lines.append(f"\\textbf{{BPE baseline}} & {bpe_pct:.2f} & -- & -- & {bpe_hits}/{bpe_hits} \\\\")
+    lines.append(r"\addlinespace")
     for r in rows:
         g = r["ppmi_gamma"]
-        bpe_pct = 100.0 * r["bpe_rate"]
         spec_pct = 100.0 * r["spec_rate"]
         d_pct = 100.0 * r["delta_rate"]
         hits = f"{r['spec_hits']}/{r['bpe_hits']}"
-        lines.append(
-            f"{g:.2f} & {bpe_pct:.2f} & {spec_pct:.2f} & {d_pct:+.2f} & {hits} \\\\"
-        )
+        lines.append(f"{g:.2f} & -- & {spec_pct:.2f} & {d_pct:+.2f} & {hits} \\\\")
     lines.append(r"\bottomrule")
     lines.append(r"\end{tabular}")
     lines.append(r"\end{small}")
