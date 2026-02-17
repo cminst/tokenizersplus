@@ -22,7 +22,7 @@ export N_JOBS=16
 OUTROOT=pareto_sweep_lambda
 mkdir -p "$OUTROOT"
 
-LAMBDA_LIST=(0.0 0.05 0.10 0.15 0.30)
+LAMBDA_LIST=(0.0 0.05 0.10 0.15 0.2 0.25 0.30)
 
 run_one_lambda () {
   local lam="$1"
@@ -59,5 +59,4 @@ export BATCH TAU ALPHA BETA BPE_WARMSTART SIGMA_PERCENTILE RERANK_TOP EMBED_ALPH
 printf "%s\n" "${LAMBDA_LIST[@]}" | xargs -n 1 -P "$N_JOBS" -I {} bash -lc 'run_one_lambda "$@"' _ {}
 echo "[done] lambda sweep logs in: $OUTROOT"
 
-# after this I'll run the plot lambda
-python3 parse_and_plot_lambda.py
+python3 plots_lambda_figs.py

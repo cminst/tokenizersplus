@@ -34,30 +34,8 @@ x = df["coh_lambda"].values
 y_coh = df["ppmi_gain_pct"].values
 y_bpb = df["bpb_delta_pct"].values
 
-# Add extrapolated points with some randomness
-def add_extrapolated_points(x, y, ax, marker, label):
-    # Create new x values between existing points
-    x_new = []
-    y_new = []
-    for i in range(len(x)-1):
-        x_new.append(x[i])
-        y_new.append(y[i])
-
-        midpoint_x = (x[i] + x[i+1]) / 2
-        slope = (y[i+1] - y[i]) / (x[i+1] - x[i])
-        random_offset = np.random.normal(0, 0.7 * abs(y[i+1] - y[i]))
-        midpoint_y = y[i] + slope * (midpoint_x - x[i]) + random_offset
-
-        x_new.append(midpoint_x)
-        y_new.append(midpoint_y)
-
-    x_new.append(x[-1])
-    y_new.append(y[-1])
-
-    ax.plot(x_new, y_new, marker=marker, linewidth=2, label=label)
-
 # Cohesion gain subplot
-add_extrapolated_points(x, y_coh, ax_coh, 'o', "Cohesion gain")
+ax_coh.plot(x, y_coh, marker='o', linewidth=2, label="Cohesion gain")
 ax_coh.set_ylabel(r"Cohesion gain $\Delta_{\mathrm{PPMI}}$ (%) $\uparrow$")
 ax_coh.axvline(0.15, linewidth=1, linestyle=":", alpha=0.7)  # highlight default λ
 ax_coh.set_xlabel(r"Coherence strength $\lambda$")
@@ -66,7 +44,7 @@ ax_coh.legend(loc="best", frameon=True)
 ax_coh.margins(y=0.5)  # Zoom out on y axis a little
 
 # BPB change subplot
-add_extrapolated_points(x, y_bpb, ax_bpb, 's', "BPB change")
+ax_bpb.plot(x, y_bpb, marker='s', linewidth=2, label="BPB change")
 ax_bpb.set_ylabel(r"BPB change $\Delta_{\mathrm{BPB}}$ (%) $\downarrow$")
 ax_bpb.axvline(0.15, linewidth=1, linestyle=":", alpha=0.7)  # same highlight
 ax_bpb.grid(True, alpha=0.25)

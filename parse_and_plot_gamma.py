@@ -115,7 +115,8 @@ def main():
         "ps.fonttype": 42,
     })
 
-    fig, ax = plt.subplots(figsize=(7.2, 5.0))
+    scale = 0.8
+    fig, ax = plt.subplots(figsize=(7.2*scale, 5.0*scale))
     ax.scatter(xs, ys, color="C2")
     ax.plot(xs, ys, linestyle="--", linewidth=1.0, color="C2")
 
@@ -126,7 +127,12 @@ def main():
     ax.set_xlim(x_min - x_left_pad, x_max - x_right_trim)
 
     for i, r in enumerate(rows):
-        label_offset = (6, 3) if i == 0 else (0, 3)
+        label_offset = (0, 3)
+        if i == 0:
+            label_offset = (6, 3)
+        elif i == len(rows) - 1:
+            label_offset = (-6, -2)
+
         ax.annotate(
             rf"${r['ppmi_gamma']:.2f}$",
             (r["ppmi_gain_pct"], r["bpb_delta_pct"]),

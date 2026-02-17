@@ -85,7 +85,8 @@ def main():
     })
 
     # ---------- Figure A: PPMI CDF ----------
-    fig, ax = plt.subplots(figsize=(7.2, 4.6))
+    scale = 0.8
+    fig, ax = plt.subplots(figsize=(7.2*scale, 4.6*scale))
     for name, merges in [
         ("BPE", bpe_merges),
         ("BatchedBPE", bat_merges),
