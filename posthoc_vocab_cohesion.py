@@ -24,8 +24,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
-import sys
-from typing import List, Tuple, Set
+from typing import List, Set, Tuple
 
 
 def load_sanity_module(path: str):
@@ -33,7 +32,7 @@ def load_sanity_module(path: str):
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not load module from {path}")
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)  # type: ignore
+    spec.loader.exec_module(mod)
     return mod
 
 

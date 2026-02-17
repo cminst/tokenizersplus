@@ -1,7 +1,7 @@
-import pandas as pd
-import matplotlib.pyplot as plt
 from pathlib import Path
-import numpy as np
+
+import matplotlib.pyplot as plt
+import pandas as pd
 
 CSV = Path("pareto_sweep_lambda/pareto.csv")
 OUTDIR = Path("figs")
@@ -26,7 +26,7 @@ plt.rcParams.update({
 fig, (ax_coh, ax_bpb) = plt.subplots(
     nrows=1,
     ncols=2,
-    figsize=(14.4, 4.6),  # roughly double the width of the original single plot
+    figsize=(14.4, 4.6),
     sharey=False,
 )
 

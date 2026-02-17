@@ -1,8 +1,11 @@
-import argparse, json
-from pathlib import Path
-import numpy as np
-import matplotlib.pyplot as plt
+import argparse
 import importlib.util
+import json
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+
 
 def load_merges(p: Path):
     d = json.loads(p.read_text())

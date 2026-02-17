@@ -1,8 +1,9 @@
-import re
 import csv
-from pathlib import Path
-import matplotlib.pyplot as plt
 import math
+import re
+from pathlib import Path
+
+import matplotlib.pyplot as plt
 import numpy as np
 
 ROOT = Path("pareto_sweep_gamma")

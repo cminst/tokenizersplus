@@ -1,9 +1,10 @@
-import json
 import argparse
-import sys
-import re
+import json
 import os
-from spectralbpe_sanity import encode_word, encode_word_sp, pretokenize, parse_methods
+import sys
+
+from spectralbpe_sanity import encode_word, encode_word_sp, parse_methods, pretokenize
+
 
 def load_merges(json_path):
     with open(json_path, 'r') as f:
@@ -82,7 +83,7 @@ def main():
     # 1. Comparison Generator
     diffs = []
     seen_words = set()
-    
+
     print(f"Scanning {args.eval_text} for interesting differences...", file=sys.stderr)
     with open(args.eval_text, 'r', encoding='utf-8') as f:
         for line in f:
@@ -90,11 +91,11 @@ def main():
             for w in words:
                 if w in seen_words or len(w) < 5: continue
                 seen_words.add(w)
-                
+
                 # Tokenize with both
                 t_bpe = encode_word(w, bpe_rank)
                 t_spec = encode_word(w, spec_rank)
-                
+
                 # Heuristic for "interesting": Spectral keeps it whole, BPE breaks it
                 # OR Spectral has fewer tokens than BPE
                 if len(t_spec) < len(t_bpe):
@@ -146,7 +147,7 @@ Seq. Length (Avg) $\downarrow$ & 111.1 & 111.7 & +0.5\% \\
 \toprule
 %s \\
 \midrule""" % (col_spec, header))
-    
+
     # Pick top 6 interesting examples
     selected = diffs[:8]
     for _, w, tok_map in selected:

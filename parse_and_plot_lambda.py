@@ -1,6 +1,7 @@
-import re
 import csv
+import re
 from pathlib import Path
+
 import matplotlib.pyplot as plt
 
 ROOT = Path("pareto_sweep_lambda")

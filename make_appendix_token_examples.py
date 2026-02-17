@@ -1,11 +1,11 @@
 import argparse
+import importlib.util
 import json
 import random
 import re
 import urllib.request
 from pathlib import Path
-import importlib.util
-from typing import List, Tuple, Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 DEFAULT_URL = "https://www.gutenberg.org/files/1342/1342-0.txt"  # Pride and Prejudice (UTF-8)
 
