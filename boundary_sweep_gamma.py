@@ -48,6 +48,97 @@ def ensure_ladec_csv(path: str) -> None:
     print(f"[download] wrote {path}", file=sys.stderr)
 
 
+def latex_escape(s: str) -> str:
+    return (
+        s.replace("\\", "\\textbackslash{}")
+        .replace("&", "\\&")
+        .replace("%", "\\%")
+        .replace("$", "\\$")
+        .replace("#", "\\#")
+        .replace("_", "\\_")
+        .replace("{", "\\{")
+        .replace("}", "\\}")
+        .replace("~", "\\textasciitilde{}")
+        .replace("^", "\\textasciicircum{}")
+    )
+
+
+def write_latex_table(rows: List[Dict], out_path: Path, caption: str, label: str) -> None:
+    lines = []
+    lines.append(r"\begin{table}[t]")
+    lines.append(r"\centering")
+    lines.append(r"\begin{small}")
+    lines.append(r"\setlength{\tabcolsep}{6pt}")
+    lines.append(rf"\caption{{{latex_escape(caption)}}}")
+    lines.append(rf"\label{{{latex_escape(label)}}}")
+    lines.append(r"\begin{tabular}{ccccc}")
+    lines.append(r"\toprule")
+    lines.append(r"$\gamma$ & BPE (\%) & SpectralBPE (\%) & $\Delta$ (\%) & Hits (Spec/BPE) \\")
+    lines.append(r"\midrule")
+    for r in rows:
+        g = r["ppmi_gamma"]
+        bpe_pct = 100.0 * r["bpe_rate"]
+        spec_pct = 100.0 * r["spec_rate"]
+        d_pct = 100.0 * r["delta_rate"]
+        hits = f"{r['spec_hits']}/{r['bpe_hits']}"
+        lines.append(
+            f"{g:.2f} & {bpe_pct:.2f} & {spec_pct:.2f} & {d_pct:+.2f} & {hits} \\\\"
+        )
+    lines.append(r"\bottomrule")
+    lines.append(r"\end{tabular}")
+    lines.append(r"\end{small}")
+    lines.append(r"\end{table}")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def format_compound(word: str, split_idx: int) -> str:
+    # show gold split boundary
+    return word[:split_idx] + "|" + word[split_idx:]
+
+
+def collect_examples_for_gamma(
+    compounds: List[Tuple[str, int]],
+    bpe_rank: Dict[Tuple[str, str], int],
+    spec_rank: Dict[Tuple[str, str], int],
+    k: int,
+) -> Tuple[List[str], List[str]]:
+    """
+    Returns (wins, losses) where
+    win: BPE fails, SpectralBPE succeeds
+    loss: BPE succeeds, SpectralBPE fails
+    """
+    wins = []
+    losses = []
+
+    for word, split_idx in compounds:
+        bpe_toks = encode(word, bpe_rank)
+        spec_toks = encode(word, spec_rank)
+        ok_b = check_boundary(bpe_toks, split_idx)
+        ok_s = check_boundary(spec_toks, split_idx)
+        if ok_b == ok_s:
+            continue
+
+        gold = format_compound(word, split_idx)
+        if (not ok_b) and ok_s and len(wins) < k:
+            wins.append(
+                f"- {gold}\n"
+                f"  BPE        ({len(bpe_toks)}): {bpe_toks}\n"
+                f"  SpectralBPE({len(spec_toks)}): {spec_toks}\n"
+            )
+        elif ok_b and (not ok_s) and len(losses) < k:
+            losses.append(
+                f"- {gold}\n"
+                f"  BPE        ({len(bpe_toks)}): {bpe_toks}\n"
+                f"  SpectralBPE({len(spec_toks)}): {spec_toks}\n"
+            )
+
+        if len(wins) >= k and len(losses) >= k:
+            break
+
+    return wins, losses
+
+
 def encode(word: str, rank: Dict[Tuple[str, str], int]) -> List[str]:
     """Standard BPE encoding over characters with </w> on last char."""
     if not word:
@@ -146,6 +237,22 @@ def main():
                     help="Directory to write the plot PDF (default: figs)")
     ap.add_argument("--fig_name", type=str, default="boundary_gamma.pdf",
                     help="Plot filename (default: boundary_gamma.pdf)")
+    ap.add_argument("--out_tex", type=str, default=None,
+                    help="Output LaTeX table path (default: <root>/boundary_gamma.tex)")
+    ap.add_argument("--tex_caption", type=str,
+                    default="LADEC compound boundary accuracy vs. $\\gamma$ (PPMI exponent).",
+                    help="Caption for the LaTeX table.")
+    ap.add_argument("--tex_label", type=str, default="tab:ladec_boundary_gamma",
+                    help="Label for the LaTeX table.")
+    ap.add_argument("--plot", action="store_true",
+                    help="If set, also write the PDF plot (otherwise skip plotting).")
+    ap.add_argument("--examples_gamma", type=float, default=0.50,
+                    help="Gamma value to emit a small win/loss example list for (default: 0.50).")
+    ap.add_argument("--examples_k", type=int, default=10,
+                    help="How many wins and losses to output for the chosen gamma (default: 10).")
+    ap.add_argument("--examples_out", type=str, default=None,
+                    help="Output path for the example text "
+                         "(default: <root>/boundary_examples_gamma_<g>.txt)")
     ap.add_argument("--print_examples", action="store_true",
                     help="Also print differing examples for each gamma (can be large).")
     args = ap.parse_args()
@@ -154,9 +261,10 @@ def main():
     if not root.exists():
         raise SystemExit(f"[error] root not found: {root}")
 
-    gamma_dirs = discover_gamma_dirs(root)
-    if not gamma_dirs:
+    gamma_dirs_list = discover_gamma_dirs(root)
+    if not gamma_dirs_list:
         raise SystemExit(f"[error] no gamma_* dirs found under {root}")
+    gamma_dirs = {g: d for g, d in gamma_dirs_list}
 
     compounds = load_compounds(args.ladec_path)
     n = len(compounds)
@@ -168,7 +276,7 @@ def main():
     bpe_rate = 0.0
     bpe_path_str = "N/A"
 
-    for _, d in gamma_dirs:
+    for _, d in gamma_dirs_list:
         possible_bpe = d / args.bpe_name
         if possible_bpe.exists():
             print(f"[info] Loading BPE baseline from {possible_bpe}", file=sys.stderr)
@@ -187,7 +295,7 @@ def main():
     rows = []
     table_rows = []
 
-    for gamma, d in gamma_dirs:
+    for gamma, d in gamma_dirs_list:
         spec_path = d / args.spec_name
         if not spec_path.exists():
             print(f"[warn] missing {spec_path}, skipping gamma={gamma}", file=sys.stderr)
@@ -246,6 +354,44 @@ def main():
         tablefmt="github",
     ))
 
+    # ---- LaTeX table ----
+    out_tex = Path(args.out_tex) if args.out_tex else (root / "boundary_gamma.tex")
+    write_latex_table(rows, out_tex, caption=args.tex_caption, label=args.tex_label)
+    print(f"[out] wrote {out_tex}", file=sys.stderr)
+
+    # ---- Examples for a single gamma (paper-friendly) ----
+    target_gamma = args.examples_gamma
+    chosen = min(rows, key=lambda r: abs(r["ppmi_gamma"] - target_gamma))
+    chosen_gamma = chosen["ppmi_gamma"]
+    chosen_dir = gamma_dirs.get(chosen_gamma)
+    if chosen_dir is not None and bpe_rank is not None:
+        spec_path = chosen_dir / args.spec_name
+        if spec_path.exists():
+            spec_rank = {p: i for i, p in enumerate(load_merges(spec_path))}
+            wins, losses = collect_examples_for_gamma(
+                compounds=compounds,
+                bpe_rank=bpe_rank,
+                spec_rank=spec_rank,
+                k=args.examples_k,
+            )
+            out_examples = (
+                Path(args.examples_out)
+                if args.examples_out
+                else root / f"boundary_examples_gamma_{str(chosen_gamma).replace('.', 'p')}.txt"
+            )
+            text = []
+            text.append(f"LADEC boundary examples at gamma={chosen_gamma:.2f}")
+            text.append("")
+            text.append("== Wins (BPE wrong, SpectralBPE correct) ==")
+            text.extend(wins if wins else ["(none found in first pass)"])
+            text.append("")
+            text.append("== Losses (BPE correct, SpectralBPE wrong) ==")
+            text.extend(losses if losses else ["(none found in first pass)"])
+            out_examples.write_text("\n".join(text) + "\n", encoding="utf-8")
+            print(f"[out] wrote {out_examples}", file=sys.stderr)
+        else:
+            print(f"[warn] missing {spec_path}, cannot write examples", file=sys.stderr)
+
     # ---- CSV ----
     out_csv = Path(args.out_csv) if args.out_csv else (root / "boundary_gamma.csv")
     with out_csv.open("w", newline="") as f:
@@ -255,44 +401,45 @@ def main():
     print(f"\n[out] wrote {out_csv}", file=sys.stderr)
 
     # ---- Plot ----
-    os.makedirs(args.fig_dir, exist_ok=True)
-    fig_path = Path(args.fig_dir) / args.fig_name
+    if args.plot:
+        os.makedirs(args.fig_dir, exist_ok=True)
+        fig_path = Path(args.fig_dir) / args.fig_name
 
-    gammas = [r["ppmi_gamma"] for r in rows]
-    bpe_rates = [r["bpe_rate"] for r in rows]
-    spec_rates = [r["spec_rate"] for r in rows]
+        gammas = [r["ppmi_gamma"] for r in rows]
+        bpe_rates = [r["bpe_rate"] for r in rows]
+        spec_rates = [r["spec_rate"] for r in rows]
 
-    x = np.arange(len(gammas), dtype=np.float64)
-    width = 0.38
+        x = np.arange(len(gammas), dtype=np.float64)
+        width = 0.38
 
-    plt.rcParams.update({
-        "font.family": ["Times New Roman", "Times", "serif"],
-        "mathtext.fontset": "cm",
-        "font.size": 13,
-        "axes.titlesize": 16,
-        "axes.labelsize": 14,
-        "xtick.labelsize": 11,
-        "ytick.labelsize": 11,
-        "pdf.fonttype": 42,
-        "ps.fonttype": 42,
-    })
+        plt.rcParams.update({
+            "font.family": ["Times New Roman", "Times", "serif"],
+            "mathtext.fontset": "cm",
+            "font.size": 13,
+            "axes.titlesize": 16,
+            "axes.labelsize": 14,
+            "xtick.labelsize": 11,
+            "ytick.labelsize": 11,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        })
 
-    fig, ax = plt.subplots(figsize=(7.4, 4.2))
-    ax.bar(x - width/2, bpe_rates, width, label="BPE") # default color
-    ax.bar(x + width/2, spec_rates, width, label="SpectralBPE", color="C2")  # green for consistency
+        fig, ax = plt.subplots(figsize=(7.4, 4.2))
+        ax.bar(x - width/2, bpe_rates, width, label="BPE")  # default color
+        ax.bar(x + width/2, spec_rates, width, label="SpectralBPE", color="C2")  # green for consistency
 
-    ax.set_xticks(x)
-    ax.set_xticklabels([f"{g:.2f}" for g in gammas])
-    ax.set_ylabel("Boundary accuracy")
-    ax.set_xlabel(r"$\gamma$ (PPMI exponent)")
-    ax.set_title("LADEC compound boundary accuracy vs. $\gamma$")
-    ax.set_ylim(bottom=0.77, top=0.84)
-    ax.grid(True, axis="y", alpha=0.25)
-    ax.legend(loc="best")
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"{g:.2f}" for g in gammas])
+        ax.set_ylabel("Boundary accuracy")
+        ax.set_xlabel(r"$\gamma$ (PPMI exponent)")
+        ax.set_title("LADEC compound boundary accuracy vs. $\gamma$")
+        ax.set_ylim(bottom=0.77, top=0.84)
+        ax.grid(True, axis="y", alpha=0.25)
+        ax.legend(loc="best")
 
-    fig.tight_layout()
-    fig.savefig(fig_path, bbox_inches="tight")
-    print(f"[out] wrote {fig_path}", file=sys.stderr)
+        fig.tight_layout()
+        fig.savefig(fig_path, bbox_inches="tight")
+        print(f"[out] wrote {fig_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":
