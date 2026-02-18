@@ -50,12 +50,10 @@ def ensure_ladec_csv(path: str) -> None:
 
 def latex_escape(s: str) -> str:
     return (
-        s.replace("\\", "\\textbackslash{}")
+        s
         .replace("&", "\\&")
         .replace("%", "\\%")
-        .replace("$", "\\$")
         .replace("#", "\\#")
-        .replace("_", "\\_")
         .replace("{", "\\{")
         .replace("}", "\\}")
         .replace("~", "\\textasciitilde{}")
@@ -65,7 +63,7 @@ def latex_escape(s: str) -> str:
 
 def write_latex_table(rows: List[Dict], out_path: Path, caption: str, label: str) -> None:
     lines = []
-    lines.append(r"\begin{table}[t]")
+    lines.append(r"\begin{table*}[t]")
     lines.append(r"\centering")
     lines.append(r"\begin{small}")
     lines.append(r"\setlength{\tabcolsep}{6pt}")
@@ -73,22 +71,24 @@ def write_latex_table(rows: List[Dict], out_path: Path, caption: str, label: str
     lines.append(rf"\label{{{latex_escape(label)}}}")
     lines.append(r"\begin{tabular}{ccccc}")
     lines.append(r"\toprule")
-    lines.append(r"\textbf{Model / $\gamma$} & BPE (\%) & SpectralBPE (\%) & $\Delta$ (\%) & Hits (Spec/BPE) \\")
+    lines.append(r"\textbf{Tokenizer} & $\gamma$ & Boundary Accuracy & $\Delta$ & Hits \\")
     lines.append(r"\midrule")
     bpe_pct = 100.0 * rows[0]["bpe_rate"]
     bpe_hits = rows[0]["bpe_hits"]
-    lines.append(f"\\textbf{{BPE baseline}} & {bpe_pct:.2f} & -- & -- & {bpe_hits}/{bpe_hits} \\\\")
-    lines.append(r"\addlinespace")
-    for r in rows:
+    lines.append(f"Greedy BPE & -- & {bpe_pct:.2f}\\% & +0.00\\% & {bpe_hits} \\\\")
+    lines.append(r"\midrule")
+    spec_rows = len(rows)
+    for i, r in enumerate(rows):
         g = r["ppmi_gamma"]
         spec_pct = 100.0 * r["spec_rate"]
         d_pct = 100.0 * r["delta_rate"]
-        hits = f"{r['spec_hits']}/{r['bpe_hits']}"
-        lines.append(f"{g:.2f} & -- & {spec_pct:.2f} & {d_pct:+.2f} & {hits} \\\\")
+        hits = r["spec_hits"]
+        prefix = rf"\multirow{{{spec_rows}}}{{*}}{{SpectralBPE}}" if i == 0 else "    "
+        lines.append(f"{prefix} & {g:.2f} & {spec_pct:.2f}\\% & {d_pct:+.2f}\\% & {hits} \\\\")
     lines.append(r"\bottomrule")
     lines.append(r"\end{tabular}")
     lines.append(r"\end{small}")
-    lines.append(r"\end{table}")
+    lines.append(r"\end{table*}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

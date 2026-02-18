@@ -59,4 +59,5 @@ export BATCH TAU ALPHA BETA BPE_WARMSTART SIGMA_PERCENTILE RERANK_TOP EMBED_ALPH
 printf "%s\n" "${LAMBDA_LIST[@]}" | xargs -n 1 -P "$N_JOBS" -I {} bash -lc 'run_one_lambda "$@"' _ {}
 echo "[done] lambda sweep logs in: $OUTROOT"
 
-python3 plots_lambda_figs.py
+python3 parse_and_plot_lambda.py
+python3 plot_lambda_figs.py

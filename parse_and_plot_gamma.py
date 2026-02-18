@@ -149,7 +149,7 @@ def main():
 
     ax.set_xlabel(r"Cohesion gain $\Delta_{\mathrm{PPMI}}$ (%) $\uparrow$")
     ax.set_ylabel(r"BPB change $\Delta_{\mathrm{BPB}}$ (%) $\downarrow$")
-    ax.set_title(r"SpectralBPE Pareto sweep over $\gamma$ (PPMI exponent)")
+    ax.set_title(r"SpectralBPE Pareto sweep over $\beta$ (PPMI exponent)")
 
     fig.tight_layout()
 
