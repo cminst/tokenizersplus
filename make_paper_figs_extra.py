@@ -89,14 +89,14 @@ def main():
     # ---------- Figure A: PPMI CDF ----------
     scale = 0.8
     fig, ax = plt.subplots(figsize=(7.2*scale, 4.6*scale))
-    for name, merges in [
-        ("BPE", bpe_merges),
-        ("BatchedBPE", bat_merges),
-        ("SpectralBPE (knee)", knee_merges),
+    for name, merges, ls in [
+        ("BPE", bpe_merges, "-"),
+        ("BatchedBPE", bat_merges, "--"),
+        ("SpectralBPE (knee)", knee_merges, "-"),
     ]:
         vals = atomic_ppmi_list(merges)
         xs, ys = ecdf(vals)
-        ax.plot(xs, ys, linewidth=2, label=name)
+        ax.plot(xs, ys, linewidth=2, linestyle=ls, label=name)
 
     ax.grid(True, alpha=0.25)
     ax.set_xlabel(r"Atomic merge PPMI")
