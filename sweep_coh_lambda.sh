@@ -22,7 +22,7 @@ export N_JOBS=16
 OUTROOT=pareto_sweep_lambda
 mkdir -p "$OUTROOT"
 
-LAMBDA_LIST=(0.0 0.05 0.10 0.15 0.2 0.25 0.30)
+LAMBDA_LIST=(0.0 0.05 0.10 0.15 0.2 0.25 0.30 0.4 0.5 0.6 0.65 0.7 0.75 0.8 0.85 0.9 0.95 1.0)
 
 run_one_lambda () {
   local lam="$1"
