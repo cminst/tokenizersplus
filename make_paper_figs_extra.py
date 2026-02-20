@@ -89,14 +89,19 @@ def main():
     # ---------- Figure A: PPMI CDF ----------
     scale = 0.8
     fig, ax = plt.subplots(figsize=(7.2*scale, 4.6*scale))
-    for name, merges, ls in [
-        ("BPE", bpe_merges, "-"),
-        ("BatchedBPE", bat_merges, "--"),
-        ("SpectralBPE (knee)", knee_merges, "-"),
+
+    # Draw in back-to-front order; give the line that sits underneath
+    # a bit of extra width and partial transparency so the overlapping
+    # line on top stays clearly visible.
+    for name, merges, ls, lw, alpha, zorder in [
+        ("BPE",                  bpe_merges,  "-",  3.5, 0.9, 1),
+        ("BatchedBPE",           bat_merges,  "-.", 2.0, 1.0, 2),
+        ("SpectralBPE (knee)",   knee_merges, "-",  2.0, 1.0, 3),
     ]:
         vals = atomic_ppmi_list(merges)
         xs, ys = ecdf(vals)
-        ax.plot(xs, ys, linewidth=2, linestyle=ls, label=name)
+        ax.plot(xs, ys, linewidth=lw, linestyle=ls, alpha=alpha,
+                label=name, zorder=zorder)
 
     ax.grid(True, alpha=0.25)
     ax.set_xlabel(r"Atomic merge PPMI")
