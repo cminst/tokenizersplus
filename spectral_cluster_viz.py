@@ -8,7 +8,7 @@ Outputs: interactive, zoomable HTML scatter plots (Plotly WebGL) plus JSON snaps
 
 Design choice for visualization:
   - We do NOT try to render the full graph (edges explode).
-  - Pipeline: graph (adjacency-PPMI by default, or distributional similarity with --distributional_similarity) → normalized Laplacian → d-dim spectral embedding → k-means clustering (in d-dim space) → PCA to 2D → visualization
+  - Pipeline: graph (adjacency-PPMI by default; optionally adjacency log-count via --adj_log_counts, or distributional similarity via --distributional_similarity) → normalized Laplacian → d-dim spectral embedding → k-means clustering (in d-dim space) → PCA to 2D → visualization
   - We render nodes in 2D (PCA of spectral embedding), colored by cluster.
   - Hover shows token + stats; zoom/pan are unlimited.
 
@@ -148,7 +148,7 @@ def apply_merge(vocab: Dict[Tuple[str, ...], int], pair: Tuple[str, str]) -> Dic
     return dict(new)
 
 
-# ---------------- PPMI graph ----------------
+# ---------------- Graph builders ----------------
 def sym_key(a: str, b: str) -> Tuple[str, str]:
     return (a, b) if a <= b else (b, a)
 
@@ -193,6 +193,21 @@ def build_ppmi_undirected(
                 W_und[sym_key(a, b)] += w
 
     return ppmi_dir, dict(W_und)
+
+
+def build_log_count_undirected(N_dir: Counter) -> Dict[Tuple[str, str], float]:
+    """Undirected adjacency graph with smoothed log-count edge weights.
+
+    For each directed bigram count N(i,j), contribute log(1 + N(i,j))
+    to undirected edge {i,j}. This keeps high-frequency connective edges
+    while damping very large counts.
+    """
+    W_und: Dict[Tuple[str, str], float] = defaultdict(float)
+    for (a, b), c in N_dir.items():
+        if c <= 0:
+            continue
+        W_und[sym_key(a, b)] += math.log1p(float(c))
+    return dict(W_und)
 
 
 def build_distributional_similarity_undirected(
@@ -581,7 +596,9 @@ def write_snapshot_html(path: str, title: str, payload: Dict[str, Any]) -> None:
     const metaEl = document.getElementById('meta');
     const graphMeta = (m.graph_mode === 'distributional_similarity')
       ? `graph=dist_sim knn=${{m.dist_knn_k}} min_cos=${{m.dist_min_cos}}`
-      : `graph=adj_ppmi tau=${{m.tau}} ppmi_beta=${{m.ppmi_beta}}`;
+      : (m.graph_mode === 'adjacency_log_count')
+        ? `graph=adj_log_count w=log1p(N)`
+        : `graph=adj_ppmi tau=${{m.tau}} ppmi_beta=${{m.ppmi_beta}}`;
     metaEl.textContent = `step=${{m.step}} merges=${{m.merges}} | tokens=${{m.num_tokens}} | LCC=${{m.lcc_size}} (${{(100*m.lcc_frac).toFixed(1)}}%) | k=${{m.k}} d=${{m.d}} | ${{graphMeta}}`;
 
     // Search highlight
@@ -650,6 +667,7 @@ def snapshot_clusters(
     out_dir: str,
     tau: int,
     ppmi_beta: float,
+    adj_log_counts: bool,
     distributional_similarity: bool,
     dist_knn_k: int,
     dist_min_cos: float,
@@ -668,8 +686,8 @@ def snapshot_clusters(
     N_dir = pair_counts(vocab)
     freqs = token_counts(vocab)
 
-    ppmi_dir, W_adj = build_ppmi_undirected(N_dir, tau=tau, ppmi_beta=ppmi_beta)
     if distributional_similarity:
+        ppmi_dir, _ = build_ppmi_undirected(N_dir, tau=tau, ppmi_beta=ppmi_beta)
         W_und = build_distributional_similarity_undirected(
             tokens=tokens,
             ppmi_dir=ppmi_dir,
@@ -677,8 +695,10 @@ def snapshot_clusters(
             min_cos=dist_min_cos,
             batch_size=dist_batch_size,
         )
+    elif adj_log_counts:
+        W_und = build_log_count_undirected(N_dir)
     else:
-        W_und = W_adj
+        _, W_und = build_ppmi_undirected(N_dir, tau=tau, ppmi_beta=ppmi_beta)
 
     Z_all, in_lcc, evals, lcc_idx = spectral_embedding_lcc(tokens, W_und, d=d, eig_eps=eig_eps, eig_k=eig_k)
 
@@ -729,7 +749,11 @@ def snapshot_clusters(
         "d": int(d),
         "tau": int(tau),
         "ppmi_beta": float(ppmi_beta),
-        "graph_mode": "distributional_similarity" if distributional_similarity else "adjacency_ppmi",
+        "graph_mode": (
+            "distributional_similarity"
+            if distributional_similarity
+            else ("adjacency_log_count" if adj_log_counts else "adjacency_ppmi")
+        ),
         "dist_knn_k": int(dist_knn_k),
         "dist_min_cos": float(dist_min_cos),
     }
@@ -771,7 +795,7 @@ def snapshot_clusters(
             graph_desc = (
                 f"graph=dist_sim knn_k={dist_knn_k} min_cos={dist_min_cos}"
                 if distributional_similarity
-                else f"graph=adj_ppmi tau={tau} ppmi_beta={ppmi_beta}"
+                else ("graph=adj_log_count w=log1p(N)" if adj_log_counts else f"graph=adj_ppmi tau={tau} ppmi_beta={ppmi_beta}")
             )
             f.write(f"step={step} merges={merges_done} k={k_eff} d={d} {graph_desc}\n")
             f.write(f"tokens={len(tokens)} lcc={lcc_size} ({100*lcc_frac:.2f}%)\n\n")
@@ -801,6 +825,7 @@ def run(
     snapshot_every: int,
     tau: int,
     ppmi_beta: float,
+    adj_log_counts: bool,
     distributional_similarity: bool,
     dist_knn_k: int,
     dist_min_cos: float,
@@ -847,6 +872,7 @@ def run(
         out_dir=out_dir,
         tau=tau,
         ppmi_beta=ppmi_beta,
+        adj_log_counts=adj_log_counts,
         distributional_similarity=distributional_similarity,
         dist_knn_k=dist_knn_k,
         dist_min_cos=dist_min_cos,
@@ -881,6 +907,7 @@ def run(
                 out_dir=out_dir,
                 tau=tau,
                 ppmi_beta=ppmi_beta,
+                adj_log_counts=adj_log_counts,
                 distributional_similarity=distributional_similarity,
                 dist_knn_k=dist_knn_k,
                 dist_min_cos=dist_min_cos,
@@ -923,18 +950,24 @@ def main() -> None:
         "--tau",
         type=int,
         default=5,
-        help="Min bigram count to keep an adjacency edge (ignored with --distributional_similarity).",
+        help="Min bigram count to keep an adjacency PPMI edge (ignored with --distributional_similarity and --adj_log_counts).",
     )
     ap.add_argument(
         "--ppmi_beta",
         type=float,
         default=0.05,
-        help="Additive baseline for adjacency PPMI edges (ignored with --distributional_similarity).",
+        help="Additive baseline for adjacency PPMI edges (ignored with --distributional_similarity and --adj_log_counts).",
     )
-    ap.add_argument(
+    graph_mode_group = ap.add_mutually_exclusive_group()
+    graph_mode_group.add_argument(
         "--distributional_similarity",
         action="store_true",
         help="Use a distributional-similarity graph (KNN by cosine over PPMI context vectors) instead of adjacency edges.",
+    )
+    graph_mode_group.add_argument(
+        "--adj_log_counts",
+        action="store_true",
+        help="Use adjacency log-count weights w(i,j)=log(1+N(i,j)) instead of adjacency PPMI.",
     )
     ap.add_argument(
         "--dist_knn_k",
@@ -991,6 +1024,7 @@ def main() -> None:
         snapshot_every=args.snapshot_every,
         tau=args.tau,
         ppmi_beta=args.ppmi_beta,
+        adj_log_counts=args.adj_log_counts,
         distributional_similarity=args.distributional_similarity,
         dist_knn_k=args.dist_knn_k,
         dist_min_cos=args.dist_min_cos,
