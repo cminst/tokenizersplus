@@ -145,6 +145,43 @@ def write_training_command(checkpoint_dir: str) -> None:
         f.write(cmd + "\n")
 
 
+def load_merges_json(path: str) -> List[Tuple[str, str]]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"BPE merges file not found: {path}")
+    if not os.path.isfile(path):
+        raise RuntimeError(f"BPE merges path is not a file: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    raw = None
+    if isinstance(data, dict):
+        raw = data.get("merges") or data.get("bpe_merges") or data.get("merge_pairs") or data.get("merge_table")
+    elif isinstance(data, list):
+        raw = data
+
+    if raw is None or not isinstance(raw, list):
+        raise RuntimeError(f"BPE merges file is missing a merges list: {path}")
+    if not raw:
+        raise RuntimeError(f"BPE merges list is empty: {path}")
+
+    merges: List[Tuple[str, str]] = []
+    for i, pair in enumerate(raw):
+        if isinstance(pair, (list, tuple)) and len(pair) == 2:
+            a, b = pair
+        else:
+            parts = str(pair).split()
+            if len(parts) != 2:
+                raise RuntimeError(f"Invalid merge entry at index {i} in {path}: {pair!r}")
+            a, b = parts
+        if not isinstance(a, str) or not isinstance(b, str) or not a or not b:
+            raise RuntimeError(f"Invalid merge pair at index {i} in {path}: {pair!r}")
+        merges.append((a, b))
+
+    if not merges:
+        raise RuntimeError(f"No valid merges found in {path}")
+    return merges
+
+
 # ---------- BPE training ----------
 def init_vocab(word_freq: Counter) -> Dict[Tuple[str, ...], int]:
     vocab = defaultdict(int)
@@ -1573,6 +1610,12 @@ def main():
         default=None,
         help="Prefix for SentencePiece Unigram model files (default: checkpoint_dir/unigram or temp)",
     )
+    ap.add_argument(
+        "--bpe_merges",
+        type=str,
+        default=None,
+        help="Path to a JSON file with precomputed BPE merges (skips BPE training)",
+    )
 
     # SpectralBPE params
     ap.add_argument("--tau", type=int, default=2, help="Minimum pair count threshold (default: 2, was 5)")
@@ -1649,8 +1692,21 @@ def main():
     if not eval_lines:
         raise RuntimeError("No evaluation lines found.")
 
+    bpe_merges = None
+    skip_bpe_training = False
+    if args.bpe_merges:
+        if not do_bpe:
+            print("[warning] --bpe_merges provided but BPE not selected; ignoring.", file=sys.stderr)
+        else:
+            bpe_merges = load_merges_json(args.bpe_merges)
+            skip_bpe_training = True
+            print(
+                f"[train] Skipping BPE: loaded {len(bpe_merges)} merges from {args.bpe_merges}",
+                file=sys.stderr,
+            )
+
     wf = None
-    if do_bpe or do_sp:
+    if do_sp or (do_bpe and not skip_bpe_training):
         wf = build_word_freq(train_lines, args.pretokenize, args.lowercase)
         if not wf:
             raise RuntimeError("No words found in training data after pretokenization.")
@@ -1671,7 +1727,6 @@ def main():
 
         return _cb
 
-    bpe_merges = None
     sp_merges = None
     debug: Dict[str, Any] = {}
     ex_b: Dict[str, List[str]] = {}
@@ -1683,7 +1738,7 @@ def main():
     unigram_tmpdir = None
     unigram_model_prefix = args.unigram_model_prefix
 
-    if do_bpe:
+    if do_bpe and not skip_bpe_training:
         print("[train] BPE...", file=sys.stderr)
         bpe_cb = make_checkpoint_cb("bpe")
         bpe_merges = train_bpe(
