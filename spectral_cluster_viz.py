@@ -8,7 +8,8 @@ Outputs: interactive, zoomable HTML scatter plots (Plotly WebGL) plus JSON snaps
 
 Design choice for visualization:
   - We do NOT try to render the full graph (edges explode).
-  - Instead, we render nodes in 2D (PCA of spectral embedding), colored by cluster.
+  - Pipeline: PPMI-weighted graph → normalized Laplacian → d-dim spectral embedding → k-means clustering (in d-dim space) → PCA to 2D → visualization
+  - We render nodes in 2D (PCA of spectral embedding), colored by cluster.
   - Hover shows token + stats; zoom/pan are unlimited.
 
 Dependencies: numpy, scipy.
