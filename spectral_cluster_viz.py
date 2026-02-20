@@ -2,13 +2,13 @@
 Repurposed from the old SpectralBPE sanity script.
 
 Goal: run *plain* BPE training over word types (character + </w> sentinel), and
-periodically compute *spectral clusters* of the current token adjacency graph.
+periodically compute *spectral clusters* of a token graph.
 
 Outputs: interactive, zoomable HTML scatter plots (Plotly WebGL) plus JSON snapshots.
 
 Design choice for visualization:
   - We do NOT try to render the full graph (edges explode).
-  - Pipeline: PPMI-weighted graph → normalized Laplacian → d-dim spectral embedding → k-means clustering (in d-dim space) → PCA to 2D → visualization
+  - Pipeline: graph (adjacency-PPMI by default, or distributional similarity with --distributional_similarity) → normalized Laplacian → d-dim spectral embedding → k-means clustering (in d-dim space) → PCA to 2D → visualization
   - We render nodes in 2D (PCA of spectral embedding), colored by cluster.
   - Hover shows token + stats; zoom/pan are unlimited.
 
@@ -193,6 +193,95 @@ def build_ppmi_undirected(
                 W_und[sym_key(a, b)] += w
 
     return ppmi_dir, dict(W_und)
+
+
+def build_distributional_similarity_undirected(
+    tokens: List[str],
+    ppmi_dir: Dict[Tuple[str, str], float],
+    knn_k: int,
+    min_cos: float,
+    batch_size: int,
+) -> Dict[Tuple[str, str], float]:
+    """Undirected KNN graph from cosine similarity of PPMI context rows.
+
+    Context vector for token i is c_i = [PPMI(i, j)]_j.
+    Edge weight is max(0, cos(c_i, c_j)); with nonnegative PPMI this is just cosine.
+    """
+    n = len(tokens)
+    if n < 2 or not ppmi_dir:
+        return {}
+
+    k = int(knn_k)
+    if k <= 0:
+        return {}
+    k = min(k, n - 1)
+    min_cos = float(min_cos)
+    bsz = max(1, int(batch_size))
+
+    idx = {t: i for i, t in enumerate(tokens)}
+    rows: List[int] = []
+    cols: List[int] = []
+    data: List[float] = []
+    for (a, b), v in ppmi_dir.items():
+        if not (v > 0 and math.isfinite(v)):
+            continue
+        ia = idx.get(a)
+        ib = idx.get(b)
+        if ia is None or ib is None:
+            continue
+        rows.append(ia)
+        cols.append(ib)
+        data.append(float(v))
+
+    if not data:
+        return {}
+
+    C_raw = csr_matrix((data, (rows, cols)), shape=(n, n), dtype=np.float64)
+    row_sq = np.asarray(C_raw.multiply(C_raw).sum(axis=1)).ravel()
+    row_norm = np.sqrt(row_sq)
+    nonzero = row_norm > 1e-12
+    if not np.any(nonzero):
+        return {}
+
+    inv_norm = np.zeros((n,), dtype=np.float64)
+    inv_norm[nonzero] = 1.0 / row_norm[nonzero]
+    C = csr_matrix(diags(inv_norm) @ C_raw)
+
+    W_idx: Dict[Tuple[int, int], float] = {}
+    for start in range(0, n, bsz):
+        end = min(n, start + bsz)
+        # Sparse block similarities: only rows with overlapping contexts appear.
+        S = csr_matrix(C[start:end] @ C.T)
+        for r in range(end - start):
+            i = start + r
+            if not nonzero[i]:
+                continue
+
+            lo = int(S.indptr[r])
+            hi = int(S.indptr[r + 1])
+            if hi <= lo:
+                continue
+
+            nbr = S.indices[lo:hi]
+            sim = S.data[lo:hi]
+            mask = (nbr != i) & (sim > min_cos) & np.isfinite(sim)
+            if not np.any(mask):
+                continue
+
+            nbr = nbr[mask]
+            sim = sim[mask]
+            if sim.size > k:
+                keep = np.argpartition(sim, -k)[-k:]
+                nbr = nbr[keep]
+                sim = sim[keep]
+
+            for j, w in zip(nbr.tolist(), sim.tolist()):
+                a, b = (i, j) if i < j else (j, i)
+                old = W_idx.get((a, b))
+                if old is None or w > old:
+                    W_idx[(a, b)] = float(w)
+
+    return {(tokens[i], tokens[j]): float(w) for (i, j), w in W_idx.items() if w > min_cos}
 
 
 # ---------------- Spectral embedding + clustering ----------------
@@ -490,7 +579,10 @@ def write_snapshot_html(path: str, title: str, payload: Dict[str, Any]) -> None:
     // Meta
     const m = payload.meta || {{}};
     const metaEl = document.getElementById('meta');
-    metaEl.textContent = `step=${{m.step}} merges=${{m.merges}} | tokens=${{m.num_tokens}} | LCC=${{m.lcc_size}} (${{(100*m.lcc_frac).toFixed(1)}}%) | k=${{m.k}} d=${{m.d}} tau=${{m.tau}} ppmi_beta=${{m.ppmi_beta}}`;
+    const graphMeta = (m.graph_mode === 'distributional_similarity')
+      ? `graph=dist_sim knn=${{m.dist_knn_k}} min_cos=${{m.dist_min_cos}}`
+      : `graph=adj_ppmi tau=${{m.tau}} ppmi_beta=${{m.ppmi_beta}}`;
+    metaEl.textContent = `step=${{m.step}} merges=${{m.merges}} | tokens=${{m.num_tokens}} | LCC=${{m.lcc_size}} (${{(100*m.lcc_frac).toFixed(1)}}%) | k=${{m.k}} d=${{m.d}} | ${{graphMeta}}`;
 
     // Search highlight
     function highlight(query) {{
@@ -558,6 +650,10 @@ def snapshot_clusters(
     out_dir: str,
     tau: int,
     ppmi_beta: float,
+    distributional_similarity: bool,
+    dist_knn_k: int,
+    dist_min_cos: float,
+    dist_batch_size: int,
     d: int,
     k: int,
     k_auto: bool,
@@ -572,7 +668,18 @@ def snapshot_clusters(
     N_dir = pair_counts(vocab)
     freqs = token_counts(vocab)
 
-    _, W_und = build_ppmi_undirected(N_dir, tau=tau, ppmi_beta=ppmi_beta)
+    ppmi_dir, W_adj = build_ppmi_undirected(N_dir, tau=tau, ppmi_beta=ppmi_beta)
+    if distributional_similarity:
+        W_und = build_distributional_similarity_undirected(
+            tokens=tokens,
+            ppmi_dir=ppmi_dir,
+            knn_k=dist_knn_k,
+            min_cos=dist_min_cos,
+            batch_size=dist_batch_size,
+        )
+    else:
+        W_und = W_adj
+
     Z_all, in_lcc, evals, lcc_idx = spectral_embedding_lcc(tokens, W_und, d=d, eig_eps=eig_eps, eig_k=eig_k)
 
     lcc_size = int(np.sum(in_lcc))
@@ -622,6 +729,9 @@ def snapshot_clusters(
         "d": int(d),
         "tau": int(tau),
         "ppmi_beta": float(ppmi_beta),
+        "graph_mode": "distributional_similarity" if distributional_similarity else "adjacency_ppmi",
+        "dist_knn_k": int(dist_knn_k),
+        "dist_min_cos": float(dist_min_cos),
     }
 
     payload = {
@@ -658,7 +768,12 @@ def snapshot_clusters(
                 continue
             by_c[c].append((int(freqs.get(raw, 0)), raw))
         with open(os.path.join(out_dir, summary_name), "w", encoding="utf-8") as f:
-            f.write(f"step={step} merges={merges_done} k={k_eff} d={d} tau={tau} ppmi_beta={ppmi_beta}\n")
+            graph_desc = (
+                f"graph=dist_sim knn_k={dist_knn_k} min_cos={dist_min_cos}"
+                if distributional_similarity
+                else f"graph=adj_ppmi tau={tau} ppmi_beta={ppmi_beta}"
+            )
+            f.write(f"step={step} merges={merges_done} k={k_eff} d={d} {graph_desc}\n")
             f.write(f"tokens={len(tokens)} lcc={lcc_size} ({100*lcc_frac:.2f}%)\n\n")
             for c in sorted(by_c.keys()):
                 items = sorted(by_c[c], key=lambda x: (-x[0], x[1]))
@@ -686,6 +801,10 @@ def run(
     snapshot_every: int,
     tau: int,
     ppmi_beta: float,
+    distributional_similarity: bool,
+    dist_knn_k: int,
+    dist_min_cos: float,
+    dist_batch_size: int,
     d: int,
     k: int,
     k_auto: bool,
@@ -728,6 +847,10 @@ def run(
         out_dir=out_dir,
         tau=tau,
         ppmi_beta=ppmi_beta,
+        distributional_similarity=distributional_similarity,
+        dist_knn_k=dist_knn_k,
+        dist_min_cos=dist_min_cos,
+        dist_batch_size=dist_batch_size,
         d=d,
         k=k,
         k_auto=k_auto,
@@ -758,6 +881,10 @@ def run(
                 out_dir=out_dir,
                 tau=tau,
                 ppmi_beta=ppmi_beta,
+                distributional_similarity=distributional_similarity,
+                dist_knn_k=dist_knn_k,
+                dist_min_cos=dist_min_cos,
+                dist_batch_size=dist_batch_size,
                 d=d,
                 k=k,
                 k_auto=k_auto,
@@ -792,12 +919,40 @@ def main() -> None:
     ap.add_argument("--snapshot_every", type=int, default=500, help="Write a cluster snapshot every N merges.")
 
     # Graph construction
-    ap.add_argument("--tau", type=int, default=5, help="Min bigram count to keep an edge in the embedding graph.")
+    ap.add_argument(
+        "--tau",
+        type=int,
+        default=5,
+        help="Min bigram count to keep an adjacency edge (ignored with --distributional_similarity).",
+    )
     ap.add_argument(
         "--ppmi_beta",
         type=float,
         default=0.05,
-        help="Additive baseline for PPMI edges (improves connectivity; set 0 for pure PPMI).",
+        help="Additive baseline for adjacency PPMI edges (ignored with --distributional_similarity).",
+    )
+    ap.add_argument(
+        "--distributional_similarity",
+        action="store_true",
+        help="Use a distributional-similarity graph (KNN by cosine over PPMI context vectors) instead of adjacency edges.",
+    )
+    ap.add_argument(
+        "--dist_knn_k",
+        type=int,
+        default=20,
+        help="If --distributional_similarity, connect each token to up to this many nearest neighbors.",
+    )
+    ap.add_argument(
+        "--dist_min_cos",
+        type=float,
+        default=1e-6,
+        help="If --distributional_similarity, keep cosine edges greater than this threshold.",
+    )
+    ap.add_argument(
+        "--dist_batch_size",
+        type=int,
+        default=256,
+        help="Batch size for sparse cosine computation in distributional-similarity mode.",
     )
 
     # Spectral clustering
@@ -836,6 +991,10 @@ def main() -> None:
         snapshot_every=args.snapshot_every,
         tau=args.tau,
         ppmi_beta=args.ppmi_beta,
+        distributional_similarity=args.distributional_similarity,
+        dist_knn_k=args.dist_knn_k,
+        dist_min_cos=args.dist_min_cos,
+        dist_batch_size=args.dist_batch_size,
         d=args.embed_dim,
         k=k,
         k_auto=k_auto,
