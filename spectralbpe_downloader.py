@@ -9,7 +9,6 @@ def write_split(ds, split_name: str, out_path: str, max_lines: int | None):
             text = ex.get("text", "")
             if text is None:
                 continue
-            # Keep lines "as text" but drop empty lines to reduce noise
             text = text.replace("\r", "").strip("\n")
             if text.strip() == "":
                 continue

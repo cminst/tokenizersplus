@@ -1,6 +1,5 @@
-"""spectral_cluster_viz.py
-
-Repurposed from the earlier SpectralBPE sanity script.
+"""
+Repurposed from the old SpectralBPE sanity script.
 
 Goal: run *plain* BPE training over word types (character + </w> sentinel), and
 periodically compute *spectral clusters* of the current token adjacency graph.
@@ -12,7 +11,7 @@ Design choice for visualization:
   - Instead, we render nodes in 2D (PCA of spectral embedding), colored by cluster.
   - Hover shows token + stats; zoom/pan are unlimited.
 
-Dependencies: numpy, scipy. (No sklearn; we ship a small k-means.)
+Dependencies: numpy, scipy.
 
 Example:
   python spectral_cluster_viz.py \
