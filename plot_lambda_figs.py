@@ -53,7 +53,7 @@ ax_bpb.legend(loc="best", frameon=True)
 ax_bpb.margins(y=0.5)  # Zoom out on y axis a little
 
 # Overall title
-fig.suptitle(r"Ablation over $\lambda$ at fixed $\gamma=0.50$", fontsize=18)
+fig.suptitle(r"Ablation over $\lambda$ at fixed $\beta=0.50$", fontsize=18)
 
 fig.tight_layout(rect=[0, 0.03, 1, 0.95])  # leave space for suptitle
 fig.savefig(OUTDIR / "lambda_ablation.pdf", bbox_inches="tight")
