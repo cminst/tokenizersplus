@@ -33,5 +33,10 @@ uv.lock
 *.tex
 
 
+# SpectralBPE intermediate checkpoints (step-numbered merges)
+*_merges_??????.json
+
+
+
 data/*
 gemini.md
