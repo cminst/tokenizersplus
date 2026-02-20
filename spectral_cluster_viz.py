@@ -15,7 +15,7 @@ Dependencies: numpy, scipy.
 
 Example:
   python spectral_cluster_viz.py \
-    --train_text data/wikitext_train.txt \
+    --train_text data/train.txt \
     --vocab_size 16000 \
     --snapshot_every 500 \
     --out_dir out/cluster_viz
